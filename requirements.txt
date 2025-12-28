@@ -8,9 +8,16 @@ openai==0.28.1
 langchain==0.0.352
 langgraph==0.0.20
 
-# Local RAG (Chroma + HF embeddings)
+# Local RAG (Chroma + embeddings)
 chromadb==1.3.7
 sentence-transformers==5.1.2
+BCEmbedding>=0.1.5  # Required for embedding & reranking (maidalun1020/bce-embedding-base_v1)
+
+# PyTorch - GPU acceleration for embeddings
+# Supports: CUDA (NVIDIA), MPS (Apple Silicon), CPU
+# Default pip install gets CPU+MPS version (~2GB)
+# For CUDA, install separately: pip install torch --index-url https://download.pytorch.org/whl/cu118
+torch>=2.0.0
 
 # Utilities
 requests

@@ -149,49 +149,81 @@ def _normalize_question_text(q: str) -> str:
     return " ".join(str(q or "").strip().split())
 
 
-def _looks_like_kb_question(user_message: str) -> bool:
+def _looks_like_kb_question(user_message: str) -> Tuple[bool, float]:
     """粗粒度判断：用户在问科普/机制/传播途径等知识问题，而非个体问诊。
 
+    返回：(是否科普问题, 置信度 0.0-1.0)
+
+    置信度分层：
+    - 0.9: 强信号（典型科普句式）
+    - 0.7: 中信号（含科普关键词但句式不典型）
+    - 0.0: 非科普问题
+
     目标：避免对纯科普问题反复追问年龄/性别等。
-    这是启发式规则，宁可保守一点（少触发）也不要误伤问诊。
+    批次3增强：支持置信度分层。
     """
 
     msg = str(user_message or "").strip()
     if not msg:
-        return False
+        return False, 0.0
 
-    # 典型问法关键词
+    # 强信号：典型科普问句模式（高置信度）
+    strong_patterns = [
+        r"是什么[病症疾]?[？?]?$",
+        r"(怎么|如何)(感染|传播|预防)",
+        r"(原因|原理|机制)是",
+        r"(潜伏期|传染期)多[长久]",
+        r"会不会(传染|遗传)",
+        r"能不能(传染|治愈)",
+        r"有什么(区别|不同)",
+    ]
+    for pattern in strong_patterns:
+        if re.search(pattern, msg):
+            # 如果包含个人标记，降低置信度
+            if any(w in msg for w in ["我", "我的", "本人"]):
+                return True, 0.7
+            return True, 0.9
+
+    # 中信号：含科普意图词但句式不典型
     intent_words = [
-        "是什么",
-        "为什么",
-        "怎么",
-        "如何",
-        "原因",
-        "原理",
-        "机制",
-        "传播",
-        "传染",
-        "感染",
-        "途径",
-        "预防",
-        "潜伏期",
-        "传染期",
-        "会不会",
-        "能不能",
-        "区别",
+        "是什么", "为什么", "怎么", "如何", "原因", "原理", "机制",
+        "传播", "传染", "感染", "途径", "预防", "潜伏期", "传染期",
+        "会不会", "能不能", "区别",
     ]
     if not any(w in msg for w in intent_words):
-        return False
+        return False, 0.0
 
     # 如果用户明确在描述自己症状/就医求助，优先走问诊
     personal_markers = ["我", "我的", "本人", "孩子", "家人", "发烧", "头痛", "咳嗽", "腹痛", "呕吐", "腹泻", "出血", "疼"]
     if any(w in msg for w in personal_markers):
-        # 仍允许“我想问…怎么感染”这种，但要更严格
+        # 仍允许"我想问…怎么感染"这种
         if "怎么感染" in msg or ("传播" in msg and "怎么" in msg) or ("传染" in msg and "怎么" in msg):
-            return True
+            return True, 0.7
+        return False, 0.0
+
+    return True, 0.7
+
+
+# ===== 批次2新增：追问次数上限 =====
+MAX_ASK_PER_SLOT = 2  # 同一槽位最多追问次数
+
+
+def _user_declined_slot(user_message: str) -> bool:
+    """检测用户是否拒绝回答当前追问。
+
+    用于避免反复追问用户明确不愿回答的内容。
+    批次2新增。
+    """
+    msg = (user_message or "").strip().lower()
+    if not msg:
         return False
 
-    return True
+    decline_patterns = [
+        "不想说", "不方便", "不告诉", "跳过", "下一个",
+        "不知道", "不确定", "不清楚", "不想回答", "不方便透露",
+        "跳过这个", "不说了", "算了", "不用问了", "不回答",
+    ]
+    return any(p in msg for p in decline_patterns)
 
 
 def _questions_hash(questions: List[Dict[str, Any]], ask_text: str) -> str:
@@ -202,11 +234,19 @@ def _questions_hash(questions: List[Dict[str, Any]], ask_text: str) -> str:
     return _stable_hash_text(joined)
 
 
-def _missing_slots(slots: Slots, user_message: str) -> List[str]:
+def _missing_slots(slots: Slots, user_message: str, sess: Optional[AgentSessionState] = None) -> List[str]:
     """根据当前 slots 缺口动态决定追问槽位顺序（优先级而非写死）。
+
+    批次2增强：
+    - 新增 sess 参数
+    - 过滤已达追问上限的槽位
+    - 检测用户拒绝回答
 
     约束：每轮最多 3 个。
     """
+
+    # 检测用户是否在本轮拒绝回答
+    user_declined = _user_declined_slot(user_message)
 
     missing: List[str] = []
 
@@ -226,7 +266,7 @@ def _missing_slots(slots: Slots, user_message: str) -> List[str]:
     if slots.severity is None or not str(slots.severity or "").strip():
         missing.append("severity")
 
-    # 这些属于“可选但有帮助”的缺口
+    # 这些属于"可选但有帮助"的缺口
     if slots.fever == "unknown":
         missing.append("fever")
 
@@ -247,30 +287,46 @@ def _missing_slots(slots: Slots, user_message: str) -> List[str]:
     if slots.history is None or not str(slots.history or "").strip():
         missing.append("history")
 
-    # 去重并最多 3 个
-    out: List[str] = []
+    # ===== 批次2新增：过滤已达追问上限或用户拒绝的槽位 =====
+    filtered: List[str] = []
     seen = set()
     for s in missing:
         if s in seen:
             continue
         seen.add(s)
-        if s in FOLLOW_UP_BANK:
-            out.append(s)
-        if len(out) >= 3:
+        if s not in FOLLOW_UP_BANK:
+            continue
+
+        # 检查追问次数
+        if sess is not None:
+            count = sess.slot_ask_counts.get(s, 0)
+            if count >= MAX_ASK_PER_SLOT:
+                continue
+            # 如果用户本轮拒绝，且该槽位上一轮刚追问过，跳过
+            if user_declined and s in sess.asked_slots[-3:]:
+                continue
+
+        filtered.append(s)
+        if len(filtered) >= 3:
             break
-    return out
+
+    return filtered
 
 
 def _build_structured_questions(sess: AgentSessionState, user_message: str) -> Tuple[str, List[Dict[str, Any]], List[str]]:
     """生成结构化 questions + 兼容 next_questions。
 
+    批次2增强：
+    - 传递 sess 到 _missing_slots()
+    - 更新 slot_ask_counts
     - anti-repeat：同一槽位每轮用不同句式（尽量避免连续重复同一句）
     - asked_slots/last_questions_hash：用于降低重复刷屏概率
     """
 
     ask_text = _pick_ask_text(sess)
     slots = sess.slots
-    slots_to_ask = _missing_slots(slots, user_message)
+    # ===== 批次2改动：传递 sess =====
+    slots_to_ask = _missing_slots(slots, user_message, sess)
 
     questions: List[Dict[str, Any]] = []
     for slot in slots_to_ask:
@@ -279,7 +335,7 @@ def _build_structured_questions(sess: AgentSessionState, user_message: str) -> T
         if not variants:
             continue
 
-        # 可复现的“换措辞”：基于轮次与上次追问 hash 选择不同 variant
+        # 可复现的"换措辞"：基于轮次与上次追问 hash 选择不同 variant
         seed = f"{sess.session_id}|{slot}|{sess.last_questions_hash}|{len(sess.messages)}"
         idx = int(_sha256_text(seed)[:8], 16) % len(variants)
         question_text = str(variants[idx]).strip()
@@ -299,6 +355,9 @@ def _build_structured_questions(sess: AgentSessionState, user_message: str) -> T
             q["range"] = [r[0], r[1]]
 
         questions.append(q)
+
+        # ===== 批次2新增：更新追问次数 =====
+        sess.slot_ask_counts[slot] = sess.slot_ask_counts.get(slot, 0) + 1
 
     next_questions = [str(q.get("question") or "").strip() for q in questions if str(q.get("question") or "").strip()]
 
@@ -662,23 +721,41 @@ def _citations_from_evidence(evidence: List[Dict[str, Any]]) -> List[Dict[str, A
 def _ensure_answer_contract(answer: str, evidence: List[Dict[str, Any]]) -> str:
     """确保回答满足契约：引用与免责声明。
 
-    - 若 evidence 非空：至少包含一行 `引用：[E1][E2]`（按现有 eid 顺序）。
-    - 若 evidence 为空：输出 `引用：[]`。
-    - 末尾必须包含免责声明。
+    - 校验 LLM 输出中的引用 ID 是否在 evidence 中存在，移除无效引用
+    - 若 evidence 非空：至少包含一行 `引用：[E1][E2]`（按现有 eid 顺序）
+    - 若 evidence 为空：输出 `引用：[]`
+    - 末尾必须包含标准化免责声明（固定位置）
     """
 
     s = (answer or "").strip()
-    eids = [str(ev.get("eid") or "").strip() for ev in (evidence or []) if str(ev.get("eid") or "").strip()]
-    cite_line = "引用：[]" if not eids else "引用：" + "".join([f"[{eid}]" for eid in eids])
 
-    if "引用：" not in s:
-        s = (s + "\n\n" + cite_line).strip()
+    # 获取有效的 evidence IDs
+    valid_eids = {str(ev.get("eid") or "").strip() for ev in (evidence or []) if str(ev.get("eid") or "").strip()}
 
-    disclaimer = "免责声明：本回答仅供信息参考，不能替代医生面诊。"
-    if "免责声明" not in s:
-        s = (s + "\n" + disclaimer).strip()
+    # 提取回答中的引用 ID 并校验
+    cited_in_text = set(re.findall(r'\[(E\d+)\]', s))
+    invalid_cites = cited_in_text - valid_eids
+    if invalid_cites:
+        # 移除无效引用
+        for invalid in invalid_cites:
+            s = s.replace(f"[{invalid}]", "")
 
-    return s
+    # 标准化免责声明（统一格式）
+    DISCLAIMER = "免责声明：本回答仅供信息参考，不能替代医生面诊。"
+
+    # 移除现有的引用行和免责声明（可能格式不一致），后续统一添加
+    s = re.sub(r"\n*引用[：:]\s*\[?[^\n]*\]?\s*\n*", "\n", s)
+    s = re.sub(r"\n*免责声明[：:][^\n]*\n*", "\n", s)
+    s = s.strip()
+
+    # 构建标准化引用行
+    eids_sorted = sorted([eid for eid in valid_eids], key=lambda x: int(x[1:]) if x[1:].isdigit() else 0)
+    cite_line = "引用：[]" if not eids_sorted else "引用：" + "".join([f"[{eid}]" for eid in eids_sorted])
+
+    # 强制格式：正文 + 空行 + 引用 + 换行 + 免责
+    s = s + "\n\n" + cite_line + "\n" + DISCLAIMER
+
+    return s.strip()
 
 
 def _node_safety_gate(state: AgentGraphState) -> Dict[str, Any]:
@@ -692,6 +769,12 @@ def _node_safety_gate(state: AgentGraphState) -> Dict[str, Any]:
     msg = str(state.get("user_message") or "").strip()
 
     hits = _looks_like_red_flag(msg)
+
+    # 记录 safety_flags 到 trace
+    tr = state.get("trace") if isinstance(state.get("trace"), dict) else {}
+    tr["safety_flags"] = hits if hits else []
+    state["trace"] = cast(Dict[str, Any], tr)
+
     if hits:
         sess.slots = sess.slots.model_copy(update={"red_flags": hits})
         sess.safety_level = "critical"
@@ -729,6 +812,9 @@ def _node_memory_update(state: AgentGraphState) -> Dict[str, Any]:
     # 记录用户消息
     sess.append_message("user", msg)
 
+    # ===== 批次1新增：记录更新前的槽位 =====
+    old_slots = sess.slots.model_dump()
+
     # 抽取策略：优先 LLM，失败则规则兜底；支持强制 rules（用于离线自测/CI）
     patch_slots: Slots
     forced = str(os.getenv("AGENT_SLOT_EXTRACTOR", "auto")).strip().lower()
@@ -754,6 +840,16 @@ def _node_memory_update(state: AgentGraphState) -> Dict[str, Any]:
     # summary 用规则稳定构建
     sess.summary = build_summary_from_slots(sess.slots)
 
+    # ===== 批次1新增：记录槽位变化到 trace =====
+    new_slots = sess.slots.model_dump()
+    slots_changed = [k for k in old_slots if old_slots[k] != new_slots[k]]
+
+    tr = state.get("trace")
+    if not isinstance(tr, dict):
+        tr = {}
+    tr["slots_changed"] = slots_changed
+    state["trace"] = cast(Dict[str, Any], tr)
+
     _trace_end(state, node, t0)
     return {"session": sess}
 
@@ -772,17 +868,26 @@ def _node_triage_planner(state: AgentGraphState) -> Dict[str, Any]:
         return {"mode": "escalate"}
 
     slots = sess.slots
-
-    # 知识问答直达：不要求补全问诊槽位
     user_msg = str(state.get("user_message") or "").strip()
-    if _looks_like_kb_question(user_msg):
+
+    # ===== 批次3改动：使用带置信度的 kb_qa 检测 =====
+    is_kb, kb_confidence = _looks_like_kb_question(user_msg)
+
+    tr_any = state.get("trace")
+    tr = tr_any if isinstance(tr_any, dict) else {}
+
+    # 记录 kb_qa 统计
+    tr["kb_qa_stats"] = {
+        "detected": is_kb,
+        "confidence": kb_confidence,
+    }
+
+    if is_kb and kb_confidence >= 0.7:
+        # 知识问答直达：不要求补全问诊槽位
         state["mode"] = "answer"
-        # 避免前端残留旧追问
         state["ask_text"] = ""
         state["questions"] = []
         state["next_questions"] = []
-        tr_any = state.get("trace")
-        tr = tr_any if isinstance(tr_any, dict) else {}
         tr["planner_strategy"] = "kb_qa"
         state["trace"] = cast(Dict[str, Any], tr)
         _trace_end(state, node, t0)
@@ -795,6 +900,10 @@ def _node_triage_planner(state: AgentGraphState) -> Dict[str, Any]:
             "citations": state.get("citations"),
             "session": sess,
         }
+
+    # 正常问诊流程
+    tr["planner_strategy"] = "triage"
+    state["trace"] = cast(Dict[str, Any], tr)
 
     if not _slots_sufficient_for_answer(slots):
         ask_text, questions, next_questions = _build_structured_questions(sess, user_msg)

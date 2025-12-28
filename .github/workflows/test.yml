@@ -1,0 +1,87 @@
+name: CI Tests
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  # 快速单元测试（不需要外部 API）
+  unit-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov
+          pip install fastapi uvicorn pydantic httpx
+          pip install langchain langgraph openai
+          pip install chromadb sentence-transformers
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Run unit tests (offline mode)
+        env:
+          AGENT_SLOT_EXTRACTOR: rules
+          CHAT_SLOT_EXTRACTOR: rules
+          DEEPSEEK_API_KEY: test-key-for-ci
+          RAG_PERSIST_DIR: /tmp/test_kb_store
+        run: |
+          # 创建空的向量库目录
+          mkdir -p /tmp/test_kb_store
+
+          # 运行不需要真实 API 的测试
+          pytest tests/test_agent_answer_contract.py \
+                 tests/test_agent_anti_repeat.py \
+                 tests/test_api_auth.py \
+                 -v --tb=short
+
+      - name: Test summary
+        if: always()
+        run: echo "Unit tests completed"
+
+  # 集成测试（需要 API 密钥，可选）
+  integration-tests:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: unit-tests
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+          cache: 'pip'
+
+      - name: Install all dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Run integration tests
+        env:
+          AGENT_SLOT_EXTRACTOR: rules
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          RAG_PERSIST_DIR: /tmp/test_kb_store
+        run: |
+          mkdir -p /tmp/test_kb_store
+
+          # 如果有 API 密钥，运行完整测试
+          if [ -n "$DEEPSEEK_API_KEY" ] && [ "$DEEPSEEK_API_KEY" != "test-key-for-ci" ]; then
+            pytest tests/ -v --tb=short
+          else
+            echo "Skipping integration tests: No API key configured"
+            echo "To enable, add DEEPSEEK_API_KEY to repository secrets"
+          fi

@@ -6,6 +6,7 @@ pydantic==2.12.5
 # LLM + agent orchestration (Python 3.9 compatible)
 openai==0.28.1
 langchain==0.0.352
+langchain-community>=0.0.10
 langgraph==0.0.20
 
 # Local RAG (Chroma + embeddings)

@@ -101,8 +101,10 @@ class AgentSessionState(BaseModel):
     # 为动态追问与防重复服务：
     # - asked_slots：历史已追问过的槽位集合（只存字段名）
     # - last_questions_hash：上一轮追问问题的 hash，用于降低重复刷屏
+    # - slot_ask_counts：每个槽位的追问次数，用于 anti-repeat（批次1新增）
     asked_slots: List[str] = Field(default_factory=list, description="已追问过的槽位字段名")
     last_questions_hash: str = Field(default="", description="上一轮追问问题集合的 hash")
+    slot_ask_counts: Dict[str, int] = Field(default_factory=dict, description="每个槽位的追问次数，用于 anti-repeat")
 
     # 为安全分流服务：
     # - safety_level：none/warn/critical

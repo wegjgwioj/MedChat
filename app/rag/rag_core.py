@@ -70,6 +70,54 @@ def _safe_query_for_log(query: str) -> str:
     return f"{prefix}…(sha256={_sha256_text(q)[:12]})"
 
 
+def _rewrite_query_slimming(query: str) -> str:
+    """
+    利用 DeepSeek 大模型将患者的碎碎念转化为医学核心关键词。
+    """
+    try:
+        import os
+        from openai import OpenAI
+
+        # 1. 初始化 DeepSeek 客户端
+        client = OpenAI(
+            api_key=os.getenv("DEEPSEEK_API_KEY"),
+            base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        )
+
+        # 2. 读取prompt模板
+        from app.agent.prompts import QUERY_SLIMMING_SYSTEM, QUERY_SLIMMING_USER_TEMPLATE
+
+        # 3. 构造用户消息
+        user_message = QUERY_SLIMMING_USER_TEMPLATE.format(user_message=query)
+
+        # 4. 调用API
+        response = client.chat.completions.create(
+            model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+            messages=[
+                {"role": "system", "content": QUERY_SLIMMING_SYSTEM},
+                {"role": "user", "content": user_message}
+            ],
+            temperature=0.0,
+            max_tokens=500,
+            timeout=10
+        )
+
+        slimming_q = response.choices[0].message.content.strip()
+
+        # 5. 演示日志
+        print("\n" + "—" * 40)
+        print("【M1 检索优化：DeepSeek 语义提纯】")
+        print(f"原始提问: {query[:50]}...")
+        print(f"瘦身结果: {slimming_q}")
+        print("—" * 40 + "\n")
+
+        return slimming_q if slimming_q else query
+
+    except Exception as e:
+        print(f"⚠️  瘦身功能异常 ({type(e).__name__}: {str(e)[:100]})，已切换至原始检索。")
+        return query
+
+
 def _env_provider() -> str:
     # 新变量优先，兼容旧变量
     v = (env_str("RAG_PROVIDER", "") or env_str("RAG_EMBEDDINGS_PROVIDER", "") or "bce").strip().lower()
@@ -119,6 +167,26 @@ def get_embedder() -> Tuple[Any, EmbeddingInfo]:
         return _cached_embed
 
 
+class _CrossEncoderWrapper:
+    """Wrapper to make CrossEncoder compatible with BCEmbedding RerankerModel API."""
+
+    def __init__(self, model_name: str, device: str):
+        from sentence_transformers import CrossEncoder  # type: ignore
+
+        self._model = CrossEncoder(model_name, device=device)
+        self._device = device
+        print(f"[RAG_RERANK] INFO model={model_name} device={device}", flush=True)
+
+    def compute_score(self, pairs, enable_tqdm: bool = False):
+        """Compatible with BCEmbedding RerankerModel.compute_score()."""
+        return self._model.predict(pairs, show_progress_bar=enable_tqdm)
+
+
+def _try_load_reranker(model_name: str, device: str):
+    """尝试加载 reranker 模型，返回 (model, actual_device)。使用 CrossEncoder 支持 MPS。"""
+    return _CrossEncoderWrapper(model_name, device), device
+
+
 def get_reranker() -> Optional[Any]:
     """获取 reranker（单例缓存）。
 
@@ -126,6 +194,8 @@ def get_reranker() -> Optional[Any]:
     - 默认启用（RAG_USE_RERANKER=1）。
     - 如果明确关闭（RAG_USE_RERANKER=0），返回 None。
     - 如果启用但模型/依赖不可用，抛出可读错误信息。
+    - 支持 CUDA、MPS、CPU 设备，MPS 不可用时自动降级到 CPU。
+    - 使用 sentence-transformers CrossEncoder 代替 BCEmbedding，以支持 MPS。
     """
     global _cached_reranker
 
@@ -145,25 +215,44 @@ def get_reranker() -> Optional[Any]:
         device = resolve_embedding_device()
 
         try:
-            from BCEmbedding.models import RerankerModel  # type: ignore
+            from sentence_transformers import CrossEncoder  # type: ignore
         except Exception as e:
             raise RuntimeError(
-                "已启用 RAG_USE_RERANKER=1，但无法导入 BCEmbedding reranker。\n"
-                "解决：确认已安装 bcembedding/BCEmbedding，或设置 RAG_USE_RERANKER=0 关闭重排。\n"
+                "已启用 RAG_USE_RERANKER=1，但无法导入 sentence-transformers CrossEncoder。\n"
+                "解决：确认已安装 sentence-transformers，或设置 RAG_USE_RERANKER=0 关闭重排。\n"
                 f"导入错误：{type(e).__name__}: {e}"
             ) from e
 
         try:
-            _cached_reranker = RerankerModel(model_name_or_path=model_name, device=device)
-        except TypeError:
-            # 兼容旧签名
-            _cached_reranker = RerankerModel(model_name, device=device)
+            _cached_reranker, actual_device = _try_load_reranker(model_name, device)
+            if actual_device != device:
+                print(
+                    f"[RAG_RERANK] INFO device_fallback from={device} to={actual_device}",
+                    flush=True,
+                )
         except Exception as e:
-            raise RuntimeError(
-                "BCEmbedding reranker 模型加载失败。\n"
-                f"model={model_name} device={device}\n"
-                f"错误：{type(e).__name__}: {e}"
-            ) from e
+            # MPS 可能不完全支持某些操作，尝试降级到 CPU
+            if device == "mps":
+                print(
+                    f"[RAG_RERANK] WARN mps_fallback reason={type(e).__name__}: {e}",
+                    flush=True,
+                )
+                try:
+                    _cached_reranker, _ = _try_load_reranker(model_name, "cpu")
+                    print("[RAG_RERANK] INFO fallback_to_cpu success", flush=True)
+                except Exception as e2:
+                    raise RuntimeError(
+                        "Reranker 模型加载失败（MPS 和 CPU 均失败）。\n"
+                        f"model={model_name}\n"
+                        f"MPS 错误：{type(e).__name__}: {e}\n"
+                        f"CPU 错误：{type(e2).__name__}: {e2}"
+                    ) from e2
+            else:
+                raise RuntimeError(
+                    "Reranker 模型加载失败。\n"
+                    f"model={model_name} device={device}\n"
+                    f"错误：{type(e).__name__}: {e}"
+                ) from e
 
         return _cached_reranker
 
@@ -359,12 +448,20 @@ def retrieve(
     if not q:
         return []
 
+    # === [M1 检索优化：触发瘦身逻辑] ===
+    # 策略：长度超过 15 个字才瘦身，短句直接检索
+    search_q = q
+    if len(q) > 15:
+        search_q = _rewrite_query_slimming(q)
+    # =============================
+
     k = int(top_k) if top_k and int(top_k) > 0 else 5
     n = int(top_n) if top_n is not None else _env_top_n_default()
     if n < k:
         n = k
 
-    docs_scores = _vector_search(q, top_n=n, department=department)
+    # 使用 search_q 进行向量召回
+    docs_scores = _vector_search(search_q, top_n=n, department=department)
 
     items: List[Dict[str, Any]] = []
     for i, (doc, score) in enumerate(docs_scores, start=1):
@@ -377,6 +474,7 @@ def retrieve(
     # 是否启用 rerank：入参优先，其次环境变量
     do_rerank = _env_use_reranker() if use_rerank is None else bool(use_rerank)
     if do_rerank and items:
+        # 重排建议使用原句 q，因为精排模型需要上下文
         items = _apply_rerank(q, items)
 
     # 截断 top_k，并重建 eid 连续

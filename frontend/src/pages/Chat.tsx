@@ -216,9 +216,35 @@ export default function Chat() {
 
     // 防复读护栏：如果用户把追问问题文本原样发出，阻止发送
     if (latestAssistant?.role === 'assistant' && latestAssistant?.mode === 'ask') {
-      const qs = normalizeNonEmptyQuestions(latestAssistant.nextQuestions ?? [])
-      const hit = qs.find((q) => q.trim() === t)
-      if (hit) {
+      // 收集所有追问问题文本（包括结构化 questions 和 fallback nextQuestions）
+      const structuredQs = (latestAssistant.questions ?? []).map((q) => String(q.question ?? '').trim()).filter(Boolean)
+      const fallbackQs = normalizeNonEmptyQuestions(latestAssistant.nextQuestions ?? [])
+      const allQuestions = [...new Set([...structuredQs, ...fallbackQs])]
+
+      // 规范化用户输入：去除可能的 `- ` 前缀
+      const normalizedInput = t.replace(/^[-–—]\s*/, '').trim()
+
+      // 策略1：精确匹配
+      const exactHit = allQuestions.find((q) => {
+        const normalizedQ = q.trim()
+        return normalizedQ === t || normalizedQ === normalizedInput
+      })
+
+      // 策略2：模糊匹配 - 检测用户是否在"问问题"而非"回答问题"
+      // 条件：(1) 以问号结尾 (2) 包含追问相关的关键词
+      const isQuestion = /[？?]$/.test(normalizedInput)
+      const questionKeywords = [
+        '年龄', '多大', '几岁', '岁数',
+        '性别', '男女',
+        '多久', '多长时间', '持续', '什么时候',
+        '程度', '几分', '疼痛', '严重',
+        '症状', '不舒服', '哪里',
+        '发烧', '发热', '体温',
+      ]
+      const containsKeyword = questionKeywords.some((kw) => normalizedInput.includes(kw))
+      const fuzzyHit = isQuestion && containsKeyword
+
+      if (exactHit || fuzzyHit) {
         appendMessage({
           id: uuid(),
           role: 'assistant',

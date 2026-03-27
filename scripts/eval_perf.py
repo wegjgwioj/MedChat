@@ -133,6 +133,37 @@ def _parse_concurrency_list(s: str) -> List[int]:
     return out or [1]
 
 
+def _parse_concurrency_values(values: Any) -> List[int]:
+    if values is None:
+        return [1, 5, 10]
+    if isinstance(values, str):
+        return _parse_concurrency_list(values)
+    if isinstance(values, (list, tuple)):
+        parts: List[str] = []
+        for value in values:
+            if value is None:
+                continue
+            parts.append(str(value))
+        if not parts:
+            return [1, 5, 10]
+        merged = ",".join(parts)
+        return _parse_concurrency_list(merged)
+    return _parse_concurrency_list(str(values))
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Lightweight perf eval (async httpx) for rag + agent endpoints")
+    parser.add_argument("--base_url", default="http://127.0.0.1:8000", help="API base URL")
+    parser.add_argument("--concurrency", nargs="+", default=["1", "5", "10"], help="Concurrency list, e.g. 1 5 10 or 1,5,10")
+    parser.add_argument("--requests", "--limit", dest="requests", type=int, default=20, help="Requests per concurrency per endpoint")
+    parser.add_argument("--timeout_s", type=float, default=30.0, help="HTTP timeout per request")
+    parser.add_argument("--top_k", type=int, default=5, help="RAG top_k")
+    parser.add_argument("--meddg_path", default=None, help="Optional MedDG pickle for sampling queries")
+    parser.add_argument("--sample_queries", type=int, default=50, help="How many patient sentences to sample as queries")
+    parser.add_argument("--out_dir", default="reports", help="Output directory")
+    return parser
+
+
 def _make_rag_payloads(queries: List[str], top_k: int) -> List[Dict[str, Any]]:
     if not queries:
         queries = ["头疼怎么办", "发烧38.5怎么处理", "风疹病毒怎么感染", "皮疹伴发热", "咳嗽两周"]
@@ -150,15 +181,7 @@ def _make_agent_payloads(queries: List[str]) -> List[Dict[str, Any]]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Lightweight perf eval (async httpx) for rag + agent endpoints")
-    parser.add_argument("--base_url", default="http://127.0.0.1:8000", help="API base URL")
-    parser.add_argument("--concurrency", default="1,5,10", help="Comma-separated concurrency list")
-    parser.add_argument("--requests", type=int, default=20, help="Requests per concurrency per endpoint")
-    parser.add_argument("--timeout_s", type=float, default=30.0, help="HTTP timeout per request")
-    parser.add_argument("--top_k", type=int, default=5, help="RAG top_k")
-    parser.add_argument("--meddg_path", default=None, help="Optional MedDG pickle for sampling queries")
-    parser.add_argument("--sample_queries", type=int, default=50, help="How many patient sentences to sample as queries")
-    parser.add_argument("--out_dir", default="reports", help="Output directory")
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -180,7 +203,7 @@ def main() -> int:
     rag_url = f"{args.base_url}/v1/rag/retrieve"
     agent_url = f"{args.base_url}/v1/agent/chat_v2"
 
-    concurrencies = _parse_concurrency_list(args.concurrency)
+    concurrencies = _parse_concurrency_values(args.concurrency)
 
     rag_payloads = _make_rag_payloads(queries, args.top_k)
     agent_payloads = _make_agent_payloads(queries)

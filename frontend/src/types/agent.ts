@@ -58,3 +58,29 @@ export type AgentChatV2Response = {
   summary: string
   trace: AgentTrace
 }
+
+export type OcrIngestRequest = {
+  session_id?: string
+  file_url?: string
+  file?: File
+}
+
+export type OcrIngestResponse = {
+  session_id: string
+  task_id: string
+  status: string
+  trace_id?: string
+  source_url?: string
+  source_kind?: 'url' | 'upload'
+}
+
+export type OcrStatusResponse = {
+  task_id: string
+  status: string
+  done: boolean
+  ingested?: boolean
+  session_id?: string
+  trace_id?: string
+  picked?: string
+  message?: string
+}

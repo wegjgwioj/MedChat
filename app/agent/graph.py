@@ -40,6 +40,13 @@ from app.agent.prompts import (
 )
 from app.agent.state import AgentSessionState, Slots, build_summary_from_slots
 from app.agent.storage_sqlite import SqliteSessionStore
+from app.privacy import redact_pii_for_llm
+from app.rag.evidence_policy import is_low_evidence, summarize_evidence_quality
+from app.safety.record_guard import (
+    apply_record_conflicts_to_answer_text,
+    build_record_summary_from_slots,
+    detect_record_conflicts,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -396,13 +403,22 @@ def _looks_like_red_flag(text: str) -> List[str]:
         "喉头水肿",
         "偏瘫",
         "言语不清",
+        "剧烈头痛",
         "呕血",
         "便血",
         "黑便",
         "休克",
         "持续高热",
     ]
-    hits = [k for k in keywords if k in msg]
+    pattern_hits: List[str] = []
+    pattern_map = [
+        (r"(?:最)?剧烈(?:的)?头痛", "剧烈头痛"),
+    ]
+    for pattern, label in pattern_map:
+        if re.search(pattern, msg):
+            pattern_hits.append(label)
+
+    hits = pattern_hits + [k for k in keywords if k in msg and k not in pattern_hits]
     return hits[:6]
 
 
@@ -546,14 +562,29 @@ def _rule_extract_slots(user_message: str) -> Slots:
             break
 
     # 时长
-    m2 = re.search(r"([0-9一二三四五六七八九十]+)\s*(分钟|小时|天|周|个月|月|年)", msg)
+    m2 = re.search(r"([0-9一二三四五六七八九十两半]+)\s*(分钟|小时|天|周|个月|月|年)", msg)
     if m2:
         out.duration = f"{m2.group(1)}{m2.group(2)}"
 
     # 严重程度
-    m3 = re.search(r"\b(10|[0-9])\s*/\s*10\b", msg)
+    m3 = re.search(r"(?<!\d)(10|[0-9])\s*/\s*10(?!\d)", msg)
     if m3:
         out.severity = f"{m3.group(1)}/10"
+
+    # 过敏史
+    m4 = re.search(r"([^\s，。；;、]{1,20}过敏)", msg)
+    if m4:
+        out.allergy = m4.group(1)
+
+    # 既往史 / 基础病
+    m5 = re.search(r"(?:既往有|有)([^\s，。；;、]{1,20}(?:史|病史))", msg)
+    if m5:
+        out.history = m5.group(1)
+
+    # 用药
+    m6 = re.search(r"(?:正在|目前在|现在在|一直在)(?:吃|用)([^\s，。；;、]{1,20})", msg)
+    if m6:
+        out.meds = m6.group(1)
 
     # 红旗
     out.red_flags = _looks_like_red_flag(msg)
@@ -606,9 +637,10 @@ def _call_llm_json(system: str, user: str) -> Dict[str, Any]:
 
 
 def _extract_slots_with_llm(user_message: str) -> Slots:
+    safe_user_message = redact_pii_for_llm((user_message or "").strip())
     raw = _call_llm_json(
         SLOT_EXTRACTION_SYSTEM,
-        SLOT_EXTRACTION_USER_TEMPLATE.format(user_message=(user_message or "").strip()),
+        SLOT_EXTRACTION_USER_TEMPLATE.format(user_message=safe_user_message),
     )
     try:
         # 允许缺字段；Pydantic 会自动填默认
@@ -716,6 +748,25 @@ def _citations_from_evidence(evidence: List[Dict[str, Any]]) -> List[Dict[str, A
             }
         )
     return out
+
+
+def _build_low_evidence_answer(evidence: List[Dict[str, Any]]) -> str:
+    if evidence:
+        body = (
+            "当前仅检索到少量本地资料，证据不足以支持明确判断。\n"
+            "建议：\n"
+            "- 先补充症状持续时间、严重程度、伴随症状以及既往病史；\n"
+            "- 若方便，也请补充年龄、正在使用的药物和过敏情况；\n"
+            "- 如果出现胸痛、呼吸困难、意识改变等危险信号，请尽快线下就医。"
+        )
+    else:
+        body = (
+            "目前未检索到可靠的本地资料支持你的问题。\n"
+            "建议：\n"
+            "- 若症状轻微：注意休息、补液、观察变化；\n"
+            "- 若症状持续加重、出现胸痛、呼吸困难或意识改变等危险信号，请尽快就医。"
+        )
+    return _ensure_answer_contract(body, evidence)
 
 
 def _ensure_answer_contract(answer: str, evidence: List[Dict[str, Any]]) -> str:
@@ -839,6 +890,7 @@ def _node_memory_update(state: AgentGraphState) -> Dict[str, Any]:
 
     # summary 用规则稳定构建
     sess.summary = build_summary_from_slots(sess.slots)
+    sess.record_summary = build_record_summary_from_slots(sess.slots)
 
     # ===== 批次1新增：记录槽位变化到 trace =====
     new_slots = sess.slots.model_dump()
@@ -945,7 +997,8 @@ def _node_rag_retrieve(state: AgentGraphState) -> Dict[str, Any]:
     top_n = int(state.get("top_n") or 30)
     use_rerank = bool(state.get("use_rerank") if state.get("use_rerank") is not None else True)
 
-    rag_query = (sess.summary + "；问题：" + msg).strip("； ")
+    rag_query_parts = [str(sess.record_summary or "").strip(), str(sess.summary or "").strip(), f"问题：{msg}"]
+    rag_query = "；".join([part for part in rag_query_parts if part]).strip("； ")
 
     dept = sess.slots.department_guess
 
@@ -977,6 +1030,7 @@ def _node_rag_retrieve(state: AgentGraphState) -> Dict[str, Any]:
             "count": st.count,
             "hits": len(evidence or []),
             "latency_ms": rag_latency_ms,
+            "evidence_quality": summarize_evidence_quality(evidence),
         }
         state["trace"] = cast(Dict[str, Any], tr)
 
@@ -987,7 +1041,11 @@ def _node_rag_retrieve(state: AgentGraphState) -> Dict[str, Any]:
         evidence = []
         tr_any2 = state.get("trace")
         tr = tr_any2 if isinstance(tr_any2, dict) else {}
-        tr["rag_stats"] = {"hits": 0, "latency_ms": 0}
+        tr["rag_stats"] = {
+            "hits": 0,
+            "latency_ms": 0,
+            "evidence_quality": summarize_evidence_quality([]),
+        }
         tr["rag_error"] = f"{type(e).__name__}: {e}"
         state["trace"] = cast(Dict[str, Any], tr)
 
@@ -1029,22 +1087,29 @@ def _node_answer_compose(state: AgentGraphState) -> Dict[str, Any]:
     # answer 模式
     evidence = cast(List[Dict[str, Any]], state.get("evidence") if isinstance(state.get("evidence"), list) else [])
     evidence_block = _format_evidence_for_llm(evidence)
+    rag_stats = state.get("trace") if isinstance(state.get("trace"), dict) else {}
+    evidence_quality = {}
+    if isinstance(rag_stats, dict):
+        tmp = rag_stats.get("rag_stats")
+        if isinstance(tmp, dict) and isinstance(tmp.get("evidence_quality"), dict):
+            evidence_quality = cast(Dict[str, Any], tmp.get("evidence_quality"))
+    if not evidence_quality:
+        evidence_quality = summarize_evidence_quality(evidence)
 
-    if not evidence:
-        # 无证据：不强行调用 LLM（减少不确定性与成本）
-        ans = (
-            "目前未检索到可靠的本地资料支持你的问题。\n"
-            "建议：\n"
-            "- 若症状轻微：注意休息、补液、观察变化；\n"
-            "- 若症状持续加重、出现胸痛/呼吸困难/意识改变等危险信号，请尽快就医。\n\n"
-            "引用：[]\n"
-            "免责声明：本回答仅供信息参考，不能替代医生面诊。"
-        )
-        ans = _ensure_answer_contract(ans, [])
+    if is_low_evidence(evidence_quality):
+        ans = _build_low_evidence_answer(evidence)
+        conflicts = detect_record_conflicts(ans, sess.record_summary or build_record_summary_from_slots(sess.slots))
+        if conflicts:
+            ans = apply_record_conflicts_to_answer_text(ans, conflicts)
+            ans = _ensure_answer_contract(ans, evidence)
+        tr_any = state.get("trace")
+        tr = tr_any if isinstance(tr_any, dict) else {}
+        tr["record_conflicts"] = conflicts
+        state["trace"] = cast(Dict[str, Any], tr)
         sess.append_message("assistant", ans)
-        state["citations"] = []
+        state["citations"] = _citations_from_evidence(evidence)
         _trace_end(state, node, t0)
-        return {"answer": ans, "citations": []}
+        return {"answer": ans, "citations": state["citations"]}
 
     # 有证据：调用 LLM 生成回答
     user_msg = str(state.get("user_message") or "").strip()
@@ -1052,7 +1117,7 @@ def _node_answer_compose(state: AgentGraphState) -> Dict[str, Any]:
 
     try:
         user_prompt = ANSWER_USER_TEMPLATE.format(
-            user_message=user_msg,
+            user_message=redact_pii_for_llm(user_msg),
             summary=summary or "(无)",
             evidence_block=evidence_block or "(无)",
         )
@@ -1069,10 +1134,18 @@ def _node_answer_compose(state: AgentGraphState) -> Dict[str, Any]:
             "免责声明：本回答仅供信息参考，不能替代医生面诊。"
         )
 
+    conflicts = detect_record_conflicts(ans, sess.record_summary or build_record_summary_from_slots(sess.slots))
+    if conflicts:
+        ans = apply_record_conflicts_to_answer_text(ans, conflicts)
+
     citations = _citations_from_evidence(evidence)
     ans = _ensure_answer_contract(ans, evidence)
     sess.append_message("assistant", ans)
     state["citations"] = citations
+    tr_any = state.get("trace")
+    tr = tr_any if isinstance(tr_any, dict) else {}
+    tr["record_conflicts"] = conflicts
+    state["trace"] = cast(Dict[str, Any], tr)
 
     _trace_end(state, node, t0)
     return {"answer": ans, "citations": citations}

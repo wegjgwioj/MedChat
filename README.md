@@ -14,6 +14,9 @@
 
 - 多轮问诊：收集关键信息，决定是否进入分诊
 - 分诊：检索证据、生成结构化结果（风险等级/红旗症状/就医建议等）
+- 纵向档案摘要：从年龄/既往史/用药/过敏史中生成 `record_summary`，用于后续检索与安全约束
+- 记录感知安全护栏：当回答命中既往过敏药物时自动追加警示，并在 triage JSON 中移除高风险动作
+- OCR 入库：支持远程 URL 解析和本地文件上传，完成后自动入库到向量库
 - 引用强制：回答中的 `[E1]` 等引用必须能定位到证据块
 - 安全审查：`mode=safe` 会启用更严格的安全审查链
 - 可观测：返回 `trace`（`INQUIRY → RETRIEVE → ASSESS → SAFETY`）及耗时，便于调试与问题定位
@@ -22,8 +25,10 @@
 
 - `GET /health`：健康检查
 - `POST /v1/chat`：多轮对话入口（前端使用）
-- `POST /v1/triage`：单次分诊入口（便于独立调试）
+- `POST /v1/triage`：单次分诊入口（便于独立调试，可选传 `clinical_record_path` 参与记录安全校验）
 - `POST /v1/agent/chat_v2`：LangGraph 医患问诊 Agent（多轮 + 结构化追问 + trace）
+- `POST /v1/ocr/ingest`：创建 OCR 任务（URL 或本地文件）
+- `GET /v1/ocr/status/{task_id}`：查询 OCR 状态，完成后自动入库
 
 ---
 
@@ -93,6 +98,12 @@ conda activate healthcare-agent
 python -m pip install -r requirements.txt
 ```
 
+推荐优先使用项目自带虚拟环境执行验证命令：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
 ### 2) 配置 .env
 
 ```powershell
@@ -119,7 +130,7 @@ uvicorn app.api_server:app --host 127.0.0.1 --port 8000
 
 ```powershell
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
 
@@ -135,9 +146,18 @@ npm run dev
 - `ALLOW_SAVE_SESSION_RAW_TEXT=1`：可选，落盘保存原文（不推荐，注意隐私）
 - `CHAT_SLOT_EXTRACTOR=rules`：可选，强制不用 LLM 抽槽（用于离线测试/稳定性）
 - `AGENT_SLOT_EXTRACTOR=rules`：可选，强制 `/v1/agent/chat_v2` 不用 LLM 抽槽（用于离线测试/CI）
+- `clinical_record_path`：`/v1/triage` 可选字段；传入本地病历/摘要文本路径后，会启用基于过敏史的记录感知安全护栏
 
 Windows 兼容性：
 - 若出现 OpenMP 冲突（`libiomp5md.dll already initialized`），可设置 `KMP_DUPLICATE_LIB_OK=TRUE` 再启动后端。
+
+本地 smoke 建议：
+
+```powershell
+$env:AGENT_SLOT_EXTRACTOR = "rules"
+$env:CHAT_SLOT_EXTRACTOR = "rules"
+python -m uvicorn app.api_server:app --host 127.0.0.1 --port 8000
+```
 
 ---
 

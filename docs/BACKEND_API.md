@@ -36,6 +36,15 @@
 
 证据：见 [app/api_server.py](../app/api_server.py) 的 exception handlers。
 
+### 0.3 记录感知安全护栏
+
+- `/v1/agent/chat_v2` 会在会话内维护 `record_summary`，优先保留年龄、既往史、用药和过敏史等稳定信息。
+- `/v1/triage` 可传 `clinical_record_path`，后端会读取该文本并对回答中的高风险药物建议做记录感知校验。
+- 当前第一阶段仅覆盖“明确过敏史 -> 明确风险药物名”冲突拦截；命中后会：
+  - 在自由文本回答里追加风险提醒
+  - 在 triage JSON 中移除对应 `immediate_actions`
+  - 在 `trace` 中记录 `record.safety`
+
 ---
 
 ## 1) POST /v1/agent/chat_v2（LangGraph Agent v2）
@@ -58,6 +67,7 @@ Schema（来自 Pydantic 模型 `AgentChatV2Request`）：
 注意：
 
 - `user_message` 不能为空；否则 `run_chat_v2_turn()` 会抛 ValueError（见 [app/agent/graph.py](../app/agent/graph.py)）。
+- 进入 LLM 前会对常见 PII 做脱敏，目前包括手机号、身份证号、地址片段；原始输入不会原样拼进 prompt。
 
 请求示例：
 
@@ -90,6 +100,10 @@ Schema（来自 Pydantic 模型 `AgentChatV2Response`）：
 - `slots`：object；结构化槽位快照（见 [app/agent/state.py](../app/agent/state.py) 的 `Slots`）
 - `summary`：string；由槽位规则生成的短摘要
 - `trace`：object；可观测字段（node_order/timings_ms/rag_stats 等）
+
+补充说明：
+
+- `trace.record_conflicts`：若回答命中过敏史冲突，会返回命中的 `matched_term/record_term/message` 列表；无冲突时为空列表或缺省。
 
 字段契约（何时为空）：
 
@@ -179,6 +193,11 @@ curl -sS "http://127.0.0.1:8000/v1/rag/stats"
 - `department`：string|null，可选；科室过滤（严格等值匹配）
 - `use_rerank`：bool|null，可选；为 null 时按环境变量 `RAG_USE_RERANKER` 决定
 
+相关环境变量（影响最终 evidence 返回）：
+
+- `RAG_RERANK_MIN_SCORE`：number，可选；启用 rerank 时，仅保留 `rerank_score >= 阈值` 的证据
+- `RAG_VECTOR_MAX_SCORE`：number，可选；无论是否启用 rerank，都先过滤 `score > 阈值` 的证据
+
 Windows PowerShell（带鉴权示例）：
 
 ~~~powershell
@@ -205,6 +224,7 @@ curl -sS "http://127.0.0.1:8000/v1/rag/retrieve" \
 - `top_n`：int
 - `use_rerank`：bool（若请求未显式传，则由环境变量推导）
 - `evidence`：array[object]，证据列表
+- `evidence_quality`：object（`level/reason/count/...`，与后端统一证据质量口径一致）
 - `stats`：object（collection/count/device/embed_model/rerank_model）
 
 `evidence` 单条字段契约（由单测保障）：
@@ -217,7 +237,138 @@ curl -sS "http://127.0.0.1:8000/v1/rag/retrieve" \
 - `chunk_id`：string
 - `metadata`：object（至少包含 department/title/row/source_file）
 
+说明：
+
+- evidence 会先经过分数阈值过滤，再执行 `top_k` 截断与 `eid` 重排。
+- 因此当阈值设置较严时，返回条数可能小于请求的 `top_k`，甚至为空数组。
+
 证据：见 [app/rag/rag_core.py](../app/rag/rag_core.py) 的 `_normalize_evidence_item()` 与 `retrieve()`；单测见 [tests/test_rag_retrieve_contract.py](../tests/test_rag_retrieve_contract.py)。
+
+--- 
+
+## 3.5 POST /v1/triage（单次分诊）
+
+实现位置：见 [app/api_server.py](../app/api_server.py) 的 `triage()`，内部调用 [app/triage_service.py](../app/triage_service.py) 的 `triage_once()`。
+
+### 3.5.1 请求（JSON）
+
+- `user_text`：string，必填
+- `top_k`：int，默认 5
+- `mode`：string，`fast|safe`
+- `clinical_record_path`：string|null，可选；本地病历/记录摘要文本路径
+
+补充说明：
+
+- 当传入 `clinical_record_path` 且文本中包含明确过敏史时，后端会对结构化分诊结果做记录感知安全校验。
+
+### 3.5.2 响应补充字段
+
+- `answer.record_conflicts`：array[object]，仅在命中记录安全冲突时出现
+- `answer.uncertainty`：会追加 `record_conflict`
+- `meta.trace`：会追加 `record.safety`
+
+示例（精简）：
+
+~~~json
+{
+  "answer": {
+    "immediate_actions": [],
+    "uncertainty": "record_conflict",
+    "record_conflicts": [
+      {
+        "category": "drug_allergy",
+        "record_term": "青霉素过敏",
+        "matched_term": "阿莫西林",
+        "message": "既往记录提示青霉素过敏，应避免阿莫西林等青霉素类药物。"
+      }
+    ]
+  },
+  "meta": {
+    "trace": [
+      {"step": "record.safety", "status": "conflict", "count": 1}
+    ]
+  }
+}
+~~~
+
+---
+
+## 4) OCR 接口（MinerU）
+
+实现位置：
+
+- 路由：见 [app/api_server.py](../app/api_server.py) 的 `ocr_ingest()` 与 `ocr_status()`
+- 客户端：见 [app/ocr/mineru_client.py](../app/ocr/mineru_client.py)
+- 幂等状态落库：见 [app/agent/storage_sqlite.py](../app/agent/storage_sqlite.py) 的 `ocr_tasks` 表
+
+### 4.1 POST /v1/ocr/ingest
+
+用途：
+
+- 为远程 URL 创建 OCR 任务
+- 为本地文件创建 OCR 任务并上传到 MinerU 预签名地址
+
+支持两种请求形式，二选一：
+
+1. JSON（URL 模式）
+
+~~~json
+{
+  "session_id": "demo_s1",
+  "file_url": "https://example.com/report.pdf"
+}
+~~~
+
+2. multipart/form-data（文件上传模式）
+
+~~~text
+session_id=demo_s1
+file=<binary>
+~~~
+
+注意：
+
+- 本地文件上传不是直接把 multipart 发给 MinerU 解析接口。
+- 后端会先调用 MinerU 的 `/api/v4/file-urls/batch` 获取预签名上传地址，再把文件 PUT 上去。
+
+响应字段：
+
+- `session_id`：会话 ID
+- `task_id`：MinerU batch/task ID
+- `status`：固定为 `pending`
+- `trace_id`：MinerU trace_id（若有）
+- `source_url`：URL 模式为原始 URL；文件模式为文件名
+- `source_kind`：`url | upload`
+
+### 4.2 GET /v1/ocr/status/{task_id}
+
+用途：
+
+- 查询 MinerU OCR 状态
+- 首次完成时自动下载 `full_zip_url`，提取文本并写入 Chroma
+- 后续重复查询同一 `task_id` 不会重复入库
+
+查询参数：
+
+- `session_id`：可选；通常第一次 ingest 后无需再传
+- `source_url`：可选；仅兼容补传
+
+响应字段：
+
+- `task_id`
+- `status`
+- `done`
+- `ingested`
+- `session_id`
+- `trace_id`
+- `picked`：实际选中的结果文件（如 `result.md`）
+- `message`：失败或未入库原因
+
+状态说明：
+
+- `done=false`：仍在处理
+- `done=true, ingested=true`：已完成并已入库
+- `done=true, ingested=false`：任务完成，但未找到有效文本或结果包异常
 
 ---
 
@@ -226,6 +377,10 @@ curl -sS "http://127.0.0.1:8000/v1/rag/retrieve" \
 ### 4.1 POST /v1/triage（单次分诊）
 
 实现位置：见 [app/api_server.py](../app/api_server.py) 的 `triage()`，内部调用 `triage_once()`（见 [app/triage_service.py](../app/triage_service.py)）。
+
+说明：
+
+- `user_text` 在进入 LLM 生成分诊 JSON 前会先做 PII 脱敏（手机号、身份证号、地址片段）。
 
 请求（`TriageRequest`）：
 

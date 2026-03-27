@@ -12,6 +12,7 @@ import contextvars
 import json
 import hashlib
 import time
+import re
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -24,6 +25,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.responses import JSONResponse
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 try:
     # Prefer package-relative import so `import app.api_server` works in tests.
@@ -55,6 +57,10 @@ logger = logging.getLogger(__name__)
 
 
 _TRACE_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("trace_id", default=None)
+
+from app.agent.storage_sqlite import SqliteSessionStore
+
+_OCR_STORE = SqliteSessionStore()
 
 
 class _TraceIdFilter(logging.Filter):
@@ -144,6 +150,102 @@ def _get_output_dir() -> Path:
         out = repo_root / out
     out.mkdir(parents=True, exist_ok=True)
     return out
+
+
+def _create_mineru_task_from_url(file_url: str) -> Dict[str, Any]:
+    from app.ocr.mineru_client import create_task_from_url
+
+    task = create_task_from_url(file_url)
+    return {
+        "task_id": task.task_id,
+        "trace_id": task.trace_id,
+        "source_url": task.source_url or file_url,
+    }
+
+
+def _create_mineru_task_from_upload(file_name: str, content_type: Optional[str], file_bytes: bytes) -> Dict[str, Any]:
+    from app.ocr.mineru_client import create_upload_target, upload_file_to_presigned_url
+
+    task = create_upload_target(file_name=file_name, content_type=content_type)
+    upload_url = str((task.raw or {}).get("upload_url") or "").strip()
+    if not upload_url:
+        raise RuntimeError("MinerU 未返回上传地址")
+    upload_file_to_presigned_url(upload_url, file_bytes=file_bytes, content_type=content_type)
+    return {
+        "task_id": task.task_id,
+        "trace_id": task.trace_id,
+        "source_url": file_name,
+    }
+
+
+def _get_mineru_task_status(task_id: str) -> Dict[str, Any]:
+    from app.ocr.mineru_client import get_task_status
+
+    st = get_task_status(task_id)
+    return {
+        "task_id": st.task_id,
+        "status": st.state,
+        "done": st.is_done,
+        "trace_id": st.trace_id,
+        "full_zip_url": st.full_zip_url,
+        "data": st.data or {},
+    }
+
+
+def _download_mineru_result_zip(full_zip_url: str) -> bytes:
+    from app.ocr.mineru_client import download_result_zip
+
+    return download_result_zip(full_zip_url)
+
+
+def _extract_mineru_text_from_zip(zip_bytes: bytes) -> tuple[str, Dict[str, Any]]:
+    from app.ocr.mineru_client import extract_best_text_from_zip
+
+    return extract_best_text_from_zip(zip_bytes)
+
+
+def _get_vectordb_for_ocr():
+    from app.rag.rag_core import get_vectordb
+
+    return get_vectordb()
+
+
+async def _parse_ocr_ingest_payload(request: Request) -> Dict[str, Any]:
+    ctype = (request.headers.get("content-type") or "").lower()
+
+    session_id = ""
+    file_url = ""
+    source = ""
+    upload_name = ""
+    upload_type = ""
+    upload_bytes = b""
+
+    if "application/json" in ctype:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("OCR 请求体必须是 JSON object")
+        session_id = str(body.get("session_id") or "").strip()
+        file_url = str(body.get("file_url") or "").strip()
+        source = str(body.get("source") or "").strip()
+    else:
+        form = await request.form()
+        session_id = str(form.get("session_id") or "").strip()
+        file_url = str(form.get("file_url") or "").strip()
+        source = str(form.get("source") or "").strip()
+        file_obj = form.get("file")
+        if isinstance(file_obj, StarletteUploadFile):
+            upload_name = str(file_obj.filename or "").strip()
+            upload_type = str(file_obj.content_type or "").strip()
+            upload_bytes = await file_obj.read()
+
+    return {
+        "session_id": session_id,
+        "file_url": file_url,
+        "source": source,
+        "upload_name": upload_name,
+        "upload_type": upload_type,
+        "upload_bytes": upload_bytes,
+    }
 
 
 def _sha256_text(text: str) -> str:
@@ -1025,10 +1127,6 @@ def _get_trace_id(request: Request) -> str:
         return trace_id
     return str(uuid4())
 
-
-# Needed by session file naming sanitization.
-import re
-
 # 允许前端本地开发跨域
 app.add_middleware(
     CORSMiddleware,
@@ -1082,6 +1180,7 @@ def rag_retrieve(
     if auth_resp is not None:
         return auth_resp  # type: ignore[return-value]
 
+    from app.rag.evidence_policy import summarize_evidence_quality
     from app.rag.rag_core import get_stats, retrieve
 
     q = (req.query or "").strip()
@@ -1104,6 +1203,7 @@ def rag_retrieve(
         "top_n": int(req.top_n),
         "use_rerank": bool(effective_use_rerank),
         "evidence": evidence,
+        "evidence_quality": summarize_evidence_quality(evidence),
         "stats": {
             "collection": st.collection,
             "count": st.count,
@@ -1111,6 +1211,230 @@ def rag_retrieve(
             "embed_model": st.embed_model,
             "rerank_model": st.rerank_model,
         },
+    }
+
+
+@app.post("/v1/ocr/ingest")
+async def ocr_ingest(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+) -> Dict[str, Any]:
+    trace_id = _get_trace_id(request)
+
+    auth_resp = _auth_guard(x_api_key, trace_id)
+    if auth_resp is not None:
+        return auth_resp  # type: ignore[return-value]
+
+    payload = await _parse_ocr_ingest_payload(request)
+    session_id = payload["session_id"] or str(uuid4())
+    file_url = payload["file_url"]
+    source = payload["source"]
+    upload_name = payload["upload_name"]
+    upload_type = payload["upload_type"] or None
+    upload_bytes = payload["upload_bytes"]
+
+    if bool(file_url) == bool(upload_bytes):
+        raise HTTPException(status_code=400, detail="必须且只能提供 file_url 或 file")
+
+    try:
+        if file_url:
+            task = _create_mineru_task_from_url(file_url)
+            source_url = str(task.get("source_url") or file_url)
+            source_name = source or os.path.basename(source_url) or source_url
+            source_kind = "url"
+        else:
+            task = _create_mineru_task_from_upload(upload_name or "upload.bin", upload_type, upload_bytes)
+            source_url = str(task.get("source_url") or upload_name or "upload.bin")
+            source_name = source or upload_name or "upload.bin"
+            source_kind = "upload"
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"OCR任务创建失败: {type(e).__name__}")
+
+    _OCR_STORE.upsert_ocr_task(
+        task_id=str(task.get("task_id") or ""),
+        session_id=session_id,
+        source_url=source_url,
+        source_name=source_name,
+        source_kind=source_kind,
+        status="pending",
+        trace_id=str(task.get("trace_id") or ""),
+    )
+
+    return {
+        "session_id": session_id,
+        "task_id": str(task.get("task_id") or ""),
+        "status": "pending",
+        "trace_id": str(task.get("trace_id") or "") or None,
+        "source_url": source_url,
+        "source_kind": source_kind,
+    }
+
+
+@app.get("/v1/ocr/status/{task_id}")
+def ocr_status(
+    task_id: str,
+    request: Request,
+    session_id: Optional[str] = None,
+    source_url: Optional[str] = None,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+) -> Dict[str, Any]:
+    trace_id = _get_trace_id(request)
+
+    auth_resp = _auth_guard(x_api_key, trace_id)
+    if auth_resp is not None:
+        return auth_resp  # type: ignore[return-value]
+
+    rec = _OCR_STORE.get_ocr_task(task_id) or {}
+    sid = str(rec.get("session_id") or session_id or "").strip() or str(uuid4())
+    src_url = str(rec.get("source_url") or source_url or "").strip() or "ocr"
+    src_name = str(rec.get("source_name") or src_url or "ocr_upload").strip() or "ocr_upload"
+    src_kind = str(rec.get("source_kind") or "url").strip() or "url"
+
+    if bool(rec.get("ingested")):
+        return {
+            "task_id": task_id,
+            "status": str(rec.get("status") or "done"),
+            "done": True,
+            "ingested": True,
+            "session_id": sid,
+            "trace_id": str(rec.get("trace_id") or "") or None,
+            "picked": str(rec.get("picked") or "") or None,
+        }
+
+    try:
+        st = _get_mineru_task_status(task_id)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"MinerU 查询失败: {type(e).__name__}")
+
+    status = str(st.get("status") or "").strip() or "pending"
+    _OCR_STORE.upsert_ocr_task(
+        task_id=task_id,
+        session_id=sid,
+        source_url=src_url,
+        source_name=src_name,
+        source_kind=src_kind,
+        status=status,
+        trace_id=str(st.get("trace_id") or rec.get("trace_id") or ""),
+        ingested=bool(rec.get("ingested")),
+        chunk_id=str(rec.get("chunk_id") or ""),
+        picked=str(rec.get("picked") or ""),
+        message=str(rec.get("message") or ""),
+    )
+
+    if not bool(st.get("done")):
+        return {
+            "task_id": task_id,
+            "status": status,
+            "done": False,
+            "trace_id": str(st.get("trace_id") or rec.get("trace_id") or "") or None,
+        }
+
+    full_zip_url = str(st.get("full_zip_url") or "").strip()
+    if not full_zip_url:
+        message = "full_zip_url 为空"
+        _OCR_STORE.upsert_ocr_task(
+            task_id=task_id,
+            session_id=sid,
+            source_url=src_url,
+            source_name=src_name,
+            source_kind=src_kind,
+            status=status,
+            trace_id=str(st.get("trace_id") or rec.get("trace_id") or ""),
+            ingested=False,
+            chunk_id=str(rec.get("chunk_id") or ""),
+            picked=str(rec.get("picked") or ""),
+            message=message,
+        )
+        return {
+            "task_id": task_id,
+            "status": status,
+            "done": True,
+            "ingested": False,
+            "trace_id": str(st.get("trace_id") or rec.get("trace_id") or "") or None,
+            "message": message,
+        }
+
+    zip_bytes = _download_mineru_result_zip(full_zip_url)
+    text, pick_meta = _extract_mineru_text_from_zip(zip_bytes)
+
+    from app.rag.ingest_kb import _hard_gate, _sanitize_text
+
+    clean = _sanitize_text(text)
+    if not _hard_gate(clean):
+        message = "OCR文本不符合入库要求"
+        _OCR_STORE.upsert_ocr_task(
+            task_id=task_id,
+            session_id=sid,
+            source_url=src_url,
+            source_name=src_name,
+            source_kind=src_kind,
+            status=status,
+            trace_id=str(st.get("trace_id") or rec.get("trace_id") or ""),
+            ingested=False,
+            chunk_id=str(rec.get("chunk_id") or ""),
+            picked=str(pick_meta.get("picked") or ""),
+            message=message,
+        )
+        return {
+            "task_id": task_id,
+            "status": status,
+            "done": True,
+            "ingested": False,
+            "trace_id": str(st.get("trace_id") or rec.get("trace_id") or "") or None,
+            "message": message,
+        }
+
+    chunk_id = str(rec.get("chunk_id") or "").strip() or f"ocr:{task_id}:{_sha256_text(clean)[:8]}"
+    metadata = {
+        "source_file": src_name[:120],
+        "source": src_url[:240],
+        "page": None,
+        "section": "ocr",
+        "department": "",
+        "title": src_name[:120],
+        "row": None,
+        "domain": "ocr",
+        "chunk_id": chunk_id,
+        "source_kind": src_kind,
+        "session_id": sid,
+        "picked": pick_meta.get("picked"),
+    }
+
+    vs = _get_vectordb_for_ocr()
+    try:
+        vs.add_texts([clean], metadatas=[metadata])
+    except Exception:
+        from langchain.schema import Document  # type: ignore
+
+        vs.add_documents([Document(page_content=clean, metadata=metadata)])
+    if hasattr(vs, "persist"):
+        try:
+            vs.persist()
+        except Exception:
+            pass
+
+    _OCR_STORE.upsert_ocr_task(
+        task_id=task_id,
+        session_id=sid,
+        source_url=src_url,
+        source_name=src_name,
+        source_kind=src_kind,
+        status=status,
+        trace_id=str(st.get("trace_id") or rec.get("trace_id") or ""),
+        ingested=True,
+        chunk_id=chunk_id,
+        picked=str(pick_meta.get("picked") or ""),
+        message="",
+    )
+
+    return {
+        "task_id": task_id,
+        "status": status,
+        "done": True,
+        "ingested": True,
+        "session_id": sid,
+        "trace_id": str(st.get("trace_id") or rec.get("trace_id") or "") or None,
+        "picked": str(pick_meta.get("picked") or "") or None,
     }
 
 

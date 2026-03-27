@@ -22,6 +22,8 @@ class RagCase:
     evidence_count: int
     max_similarity: float
     hit: bool
+    evidence_quality_level: Optional[str]
+    evidence_quality_reason: Optional[str]
     error: Optional[str]
 
 
@@ -102,11 +104,13 @@ def _safe_get(d: Any, *path: str) -> Any:
     return cur
 
 
-def main() -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="RAG offline quality eval via /v1/rag/retrieve")
-    parser.add_argument("--meddg_path", required=True, help="Path to MedDG pickle e.g. app/MedDG_UTF8/test.pk")
+    parser.add_argument("--meddg_path", default=None, help="Optional explicit MedDG pickle path")
+    parser.add_argument("--meddg_dir", default="app/MedDG_UTF8", help="Directory containing MedDG split pickles")
+    parser.add_argument("--split", default="test", help="MedDG split name, e.g. test/train/dev")
     parser.add_argument("--base_url", default="http://127.0.0.1:8000", help="API base URL")
-    parser.add_argument("--n", type=int, default=200, help="Number of (query, reference) pairs to sample")
+    parser.add_argument("--n", "--limit", dest="n", type=int, default=200, help="Number of (query, reference) pairs to sample")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--top_k", type=int, default=5, help="Top K evidences")
     parser.add_argument("--top_n", type=int, default=30, help="Vector recall top_n (stage-1)")
@@ -115,9 +119,61 @@ def main() -> int:
     parser.add_argument("--sim_threshold", type=float, default=0.08, help="Hit threshold for bigram Jaccard")
     parser.add_argument("--min_evidence_len", type=int, default=30, help="Min evidence length for coverage")
     parser.add_argument("--out_dir", default="reports", help="Output directory")
+    return parser
+
+
+def resolve_meddg_path(args: argparse.Namespace) -> Path:
+    if getattr(args, "meddg_path", None):
+        meddg_path = Path(args.meddg_path)
+    else:
+        meddg_path = Path(args.meddg_dir) / f"{args.split}.pk"
+    if not meddg_path.exists():
+        raise FileNotFoundError(
+            f"MedDG 数据文件不存在：{meddg_path}。"
+            "可通过 --meddg_path 显式指定，或准备 app/MedDG_UTF8/<split>.pk 后再运行。"
+        )
+    return meddg_path
+
+
+def summarize_cases(cases: List[RagCase], *, sim_threshold: float, top_k: int) -> Dict[str, Any]:
+    total = len(cases)
+    errors = sum(1 for c in cases if c.error)
+    hits = sum(1 for c in cases if c.hit)
+    coverages = sum(1 for c in cases if c.error is None and c.evidence_count > 0)
+    long_text_coverage = sum(1 for c in cases if c.error is None and c.evidence_count > 0)
+    latencies = [c.latency_ms for c in cases]
+
+    quality_counts: Dict[str, int] = {}
+    low_quality = 0
+    for c in cases:
+        level = str(c.evidence_quality_level or "").strip()
+        if not level:
+            continue
+        quality_counts[level] = quality_counts.get(level, 0) + 1
+        if level in {"low", "none"}:
+            low_quality += 1
+
+    return {
+        "pairs": total,
+        "top_k": top_k,
+        "sim_threshold": sim_threshold,
+        "hit_rate": hits / total if total else 0.0,
+        "coverage_rate": coverages / total if total else 0.0,
+        "nonempty_evidence_rate": long_text_coverage / total if total else 0.0,
+        "avg_max_similarity": (sum(c.max_similarity for c in cases) / total) if total else 0.0,
+        "error_rate": errors / total if total else 0.0,
+        "avg_latency_ms": (sum(latencies) / len(latencies)) if latencies else 0.0,
+        "p95_latency_ms": (sorted(latencies)[int(0.95 * (len(latencies) - 1))] if latencies else 0.0),
+        "evidence_quality_counts": quality_counts,
+        "low_evidence_rate": (low_quality / total) if total else 0.0,
+    }
+
+
+def main() -> int:
+    parser = build_arg_parser()
     args = parser.parse_args()
 
-    meddg_path = Path(args.meddg_path)
+    meddg_path = resolve_meddg_path(args)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -161,6 +217,14 @@ def main() -> int:
                 if not isinstance(evidences, list):
                     evidences = []
 
+                evidence_quality_level = _safe_get(data, "evidence_quality", "level")
+                if evidence_quality_level is not None and not isinstance(evidence_quality_level, str):
+                    evidence_quality_level = str(evidence_quality_level)
+
+                evidence_quality_reason = _safe_get(data, "evidence_quality", "reason")
+                if evidence_quality_reason is not None and not isinstance(evidence_quality_reason, str):
+                    evidence_quality_reason = str(evidence_quality_reason)
+
                 max_sim = 0.0
                 for ev in evidences:
                     text = _safe_get(ev, "text")
@@ -179,6 +243,8 @@ def main() -> int:
                         evidence_count=len(evidences),
                         max_similarity=max_sim,
                         hit=hit,
+                        evidence_quality_level=evidence_quality_level,
+                        evidence_quality_reason=evidence_quality_reason,
                         error=None,
                     )
                 )
@@ -194,6 +260,8 @@ def main() -> int:
                         evidence_count=0,
                         max_similarity=0.0,
                         hit=False,
+                        evidence_quality_level=None,
+                        evidence_quality_reason=None,
                         error=str(e),
                     )
                 )
@@ -201,40 +269,7 @@ def main() -> int:
             if (i + 1) % 50 == 0:
                 print(f"progress: {i + 1}/{len(pairs)} pairs")
 
-    total = len(cases)
-    errors = sum(1 for c in cases if c.error)
-    hits = sum(1 for c in cases if c.hit)
-    coverages = sum(
-        1
-        for c in cases
-        if c.error is None and c.evidence_count > 0
-    )
-
-    # evidence length coverage (best effort)
-    # We can only compute on successful calls and when evidence text exists
-    long_text_coverage = 0
-    for c in cases:
-        if c.error is not None:
-            continue
-        # We didn't store evidence texts per-case to keep CSV smaller; treat evidence_count>0 as minimum coverage.
-        # For a stricter coverage, we record max_similarity and evidence_count only.
-        if c.evidence_count > 0:
-            long_text_coverage += 1
-
-    latencies = [c.latency_ms for c in cases]
-
-    summary: Dict[str, Any] = {
-        "pairs": total,
-        "top_k": args.top_k,
-        "sim_threshold": args.sim_threshold,
-        "hit_rate": hits / total if total else 0.0,
-        "coverage_rate": coverages / total if total else 0.0,
-        "nonempty_evidence_rate": long_text_coverage / total if total else 0.0,
-        "avg_max_similarity": (sum(c.max_similarity for c in cases) / total) if total else 0.0,
-        "error_rate": errors / total if total else 0.0,
-        "avg_latency_ms": (sum(latencies) / len(latencies)) if latencies else 0.0,
-        "p95_latency_ms": (sorted(latencies)[int(0.95 * (len(latencies) - 1))] if latencies else 0.0),
-    }
+    summary = summarize_cases(cases, sim_threshold=args.sim_threshold, top_k=args.top_k)
 
     summary_path = out_dir / "rag_eval_summary.json"
     with summary_path.open("w", encoding="utf-8") as f:
@@ -254,6 +289,8 @@ def main() -> int:
                 "evidence_count",
                 "max_similarity",
                 "hit",
+                "evidence_quality_level",
+                "evidence_quality_reason",
                 "error",
             ]
         )
@@ -268,6 +305,8 @@ def main() -> int:
                     c.evidence_count,
                     f"{c.max_similarity:.4f}",
                     1 if c.hit else 0,
+                    c.evidence_quality_level or "",
+                    c.evidence_quality_reason or "",
                     c.error or "",
                 ]
             )

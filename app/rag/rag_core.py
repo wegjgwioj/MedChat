@@ -34,6 +34,7 @@ from app.rag.utils.rag_shared import (
     resolve_persist_dir,
     resolve_embedding_device,
 )
+from app.privacy import redact_pii_for_llm
 
 
 @dataclass(frozen=True)
@@ -76,22 +77,19 @@ def _rewrite_query_slimming(query: str) -> str:
     """
     try:
         import os
-        from openai import OpenAI
+        import openai  # openai==0.28.x
 
-        # 1. 初始化 DeepSeek 客户端
-        client = OpenAI(
-            api_key=os.getenv("DEEPSEEK_API_KEY"),
-            base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-        )
+        openai.api_key = os.getenv("DEEPSEEK_API_KEY")
+        openai.api_base = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 
         # 2. 读取prompt模板
         from app.agent.prompts import QUERY_SLIMMING_SYSTEM, QUERY_SLIMMING_USER_TEMPLATE
 
         # 3. 构造用户消息
-        user_message = QUERY_SLIMMING_USER_TEMPLATE.format(user_message=query)
+        user_message = QUERY_SLIMMING_USER_TEMPLATE.format(user_message=redact_pii_for_llm(query))
 
         # 4. 调用API
-        response = client.chat.completions.create(
+        response = openai.ChatCompletion.create(
             model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
             messages=[
                 {"role": "system", "content": QUERY_SLIMMING_SYSTEM},
@@ -102,7 +100,12 @@ def _rewrite_query_slimming(query: str) -> str:
             timeout=10
         )
 
-        slimming_q = response.choices[0].message.content.strip()
+        first_choice = response.choices[0]
+        message = getattr(first_choice, "message", None)
+        if isinstance(message, dict):
+            slimming_q = str(message.get("content") or "").strip()
+        else:
+            slimming_q = str(getattr(message, "content", "") or "").strip()
 
         # 5. 演示日志
         print("\n" + "—" * 40)
@@ -147,6 +150,31 @@ def _env_top_n_default() -> int:
     if not n:
         return 30
     return max(1, int(n))
+
+
+def _env_float(name: str, default: float = 0.0) -> float:
+    raw = env_str(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+
+def _env_rerank_min_score() -> float:
+    return max(0.0, _env_float("RAG_RERANK_MIN_SCORE", 0.0))
+
+
+def _env_vector_max_score() -> Optional[float]:
+    raw = env_str("RAG_VECTOR_MAX_SCORE", "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except Exception:
+        return None
+    return value if value >= 0 else None
 
 
 def get_embedder() -> Tuple[Any, EmbeddingInfo]:
@@ -431,6 +459,31 @@ def _apply_rerank(query: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any
     return items
 
 
+def _apply_score_thresholds(items: List[Dict[str, Any]], *, use_rerank: bool) -> List[Dict[str, Any]]:
+    """Apply optional score thresholds before returning final evidence."""
+
+    vector_max_score = _env_vector_max_score()
+    rerank_min_score = _env_rerank_min_score()
+
+    filtered: List[Dict[str, Any]] = []
+    for item in items:
+        score = item.get("score")
+        if vector_max_score is not None:
+            if not isinstance(score, (int, float)) or isinstance(score, bool) or float(score) > vector_max_score:
+                continue
+
+        if use_rerank and rerank_min_score > 0:
+            rerank_score = item.get("rerank_score")
+            if not isinstance(rerank_score, (int, float)) or isinstance(rerank_score, bool):
+                continue
+            if float(rerank_score) < rerank_min_score:
+                continue
+
+        filtered.append(item)
+
+    return filtered
+
+
 def retrieve(
     query: str,
     top_k: int = 5,
@@ -447,6 +500,13 @@ def retrieve(
     q = (query or "").strip()
     if not q:
         return []
+
+    try:
+        vs = get_vectordb()
+        if int(vs._collection.count()) <= 0:  # type: ignore[attr-defined]
+            return []
+    except Exception:
+        pass
 
     # === [M1 检索优化：触发瘦身逻辑] ===
     # 策略：长度超过 15 个字才瘦身，短句直接检索
@@ -476,6 +536,8 @@ def retrieve(
     if do_rerank and items:
         # 重排建议使用原句 q，因为精排模型需要上下文
         items = _apply_rerank(q, items)
+
+    items = _apply_score_thresholds(items, use_rerank=do_rerank)
 
     # 截断 top_k，并重建 eid 连续
     items = items[:k]

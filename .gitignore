@@ -29,6 +29,7 @@ htmlcov/
 
 # ===== Project-generated outputs =====
 outputs/
+.worktrees/
 reports/*.csv
 reports/*.json
 reports/*.txt

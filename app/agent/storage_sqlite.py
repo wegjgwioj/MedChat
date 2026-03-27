@@ -51,6 +51,9 @@ class SqliteSessionStore:
     def db_path(self) -> str:
         return str(self._db_path)
 
+    def storage_meta(self) -> Dict[str, Any]:
+        return {"type": "sqlite", "db_path": self.db_path}
+
     def _connect(self) -> sqlite3.Connection:
         # check_same_thread=False 允许跨线程使用；我们用锁控制写入。
         conn = sqlite3.connect(str(self._db_path), check_same_thread=False)

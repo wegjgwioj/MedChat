@@ -97,6 +97,32 @@ python -m uvicorn app.api_server:app --host 0.0.0.0 --port 8000
 
 ---
 
+## 3.3 统一入口（推荐）
+
+脚本：
+
+- [scripts/eval_run_all.py](../scripts/eval_run_all.py)
+
+用途：
+
+- 顺序执行 Agent v2、RAG、Perf 三类评测脚本
+- 汇总 `meddg_eval_summary.json`、`rag_eval_summary.json`、`perf_eval.json`
+- 生成单一入口产物 `reports/eval_suite_summary.json`
+
+PowerShell：
+
+~~~powershell
+python scripts/eval_run_all.py --meddg_path app/MedDG_UTF8/test.pk --base_url http://127.0.0.1:8000 --out_dir reports
+~~~
+
+可选跳过：
+
+~~~powershell
+python scripts/eval_run_all.py --meddg_path app/MedDG_UTF8/test.pk --base_url http://127.0.0.1:8000 --skip_perf
+~~~
+
+---
+
 ## 4. 评测一：端到端（Agent v2，多轮回放）
 
 脚本：

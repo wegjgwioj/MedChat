@@ -73,3 +73,41 @@ def test_triage_once_records_record_conflicts_in_trace(monkeypatch, tmp_path):
     trace = payload["meta"]["trace"]
     assert any(step.get("step") == "record.safety" for step in trace)
     assert any(step.get("status") == "conflict" for step in trace if step.get("step") == "record.safety")
+
+
+def test_triage_once_does_not_treat_negative_warning_fields_as_positive_conflict(monkeypatch, tmp_path):
+    from app import triage_service
+
+    engine = triage_service.TriageEngine()
+    monkeypatch.setattr(engine, "init", lambda: None)
+    monkeypatch.setattr(engine, "retrieve_evidence", lambda rag_query, top_k, trace=None: ([], "ok", None))
+    monkeypatch.setattr(engine, "suggest_answer_raw", lambda user_text, evidence_block, trace=None: "{}")
+    monkeypatch.setattr(
+        engine,
+        "ensure_answer_json",
+        lambda raw_text, evidence_block, evidence_list, trace=None, trace_step="answer.ensure_json": {
+            "triage_level": "ROUTINE",
+            "red_flags": [],
+            "immediate_actions": [],
+            "what_not_to_do": ["不要自行服用阿莫西林。"],
+            "key_questions": [],
+            "reasoning": "考虑上呼吸道感染。",
+            "uncertainty": "",
+            "safety_notice": "因青霉素过敏，应避免阿莫西林。",
+            "citations_used": [],
+        },
+    )
+    monkeypatch.setattr(engine, "run_safety_chain", lambda answer_json, evidence_block, evidence_list, trace=None: answer_json)
+    monkeypatch.setattr(triage_service, "_ENGINE", engine, raising=False)
+
+    record_path = tmp_path / "record.txt"
+    record_path.write_text("过敏：青霉素过敏", encoding="utf-8")
+
+    payload = triage_service.triage_once(
+        user_text="喉咙痛怎么办",
+        clinical_record_path=str(record_path),
+    )
+
+    answer = payload["answer"]
+    assert "record_conflict" not in answer["uncertainty"]
+    assert answer["record_conflicts"] == []

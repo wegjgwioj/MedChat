@@ -38,10 +38,11 @@ from app.agent.prompts import (
     SLOT_EXTRACTION_SYSTEM,
     SLOT_EXTRACTION_USER_TEMPLATE,
 )
+from app.agent.storage import build_session_store
 from app.agent.state import AgentSessionState, Slots, build_summary_from_slots
-from app.agent.storage_sqlite import SqliteSessionStore
 from app.privacy import redact_pii_for_llm
 from app.rag.evidence_policy import is_low_evidence, summarize_evidence_quality
+from app.safety.conflict_judge import judge_text_conflicts
 from app.safety.record_guard import (
     apply_record_conflicts_to_answer_text,
     build_record_summary_from_slots,
@@ -79,7 +80,7 @@ class AgentGraphState(TypedDict, total=False):
     trace: Dict[str, Any]
 
 
-_STORE = SqliteSessionStore()
+_STORE = build_session_store()
 _GRAPH = None
 
 
@@ -1105,12 +1106,15 @@ def _node_answer_compose(state: AgentGraphState) -> Dict[str, Any]:
     if is_low_evidence(evidence_quality):
         ans = _build_low_evidence_answer(evidence)
         conflicts = detect_record_conflicts(ans, sess.record_summary or build_record_summary_from_slots(sess.slots))
-        if conflicts:
-            ans = apply_record_conflicts_to_answer_text(ans, conflicts)
+        confirmed_conflicts, dismissed_conflicts = judge_text_conflicts(ans, conflicts)
+        if confirmed_conflicts:
+            ans = apply_record_conflicts_to_answer_text(ans, confirmed_conflicts)
             ans = _ensure_answer_contract(ans, evidence)
         tr_any = state.get("trace")
         tr = tr_any if isinstance(tr_any, dict) else {}
-        tr["record_conflicts"] = conflicts
+        tr["record_conflicts"] = confirmed_conflicts
+        if dismissed_conflicts:
+            tr["record_conflicts_dismissed"] = dismissed_conflicts
         state["trace"] = cast(Dict[str, Any], tr)
         sess.append_message("assistant", ans)
         state["citations"] = _citations_from_evidence(evidence)
@@ -1141,8 +1145,9 @@ def _node_answer_compose(state: AgentGraphState) -> Dict[str, Any]:
         )
 
     conflicts = detect_record_conflicts(ans, sess.record_summary or build_record_summary_from_slots(sess.slots))
-    if conflicts:
-        ans = apply_record_conflicts_to_answer_text(ans, conflicts)
+    confirmed_conflicts, dismissed_conflicts = judge_text_conflicts(ans, conflicts)
+    if confirmed_conflicts:
+        ans = apply_record_conflicts_to_answer_text(ans, confirmed_conflicts)
 
     citations = _citations_from_evidence(evidence)
     ans = _ensure_answer_contract(ans, evidence)
@@ -1150,7 +1155,9 @@ def _node_answer_compose(state: AgentGraphState) -> Dict[str, Any]:
     state["citations"] = citations
     tr_any = state.get("trace")
     tr = tr_any if isinstance(tr_any, dict) else {}
-    tr["record_conflicts"] = conflicts
+    tr["record_conflicts"] = confirmed_conflicts
+    if dismissed_conflicts:
+        tr["record_conflicts_dismissed"] = dismissed_conflicts
     state["trace"] = cast(Dict[str, Any], tr)
 
     _trace_end(state, node, t0)
@@ -1169,7 +1176,7 @@ def _node_persist_state(state: AgentGraphState) -> Dict[str, Any]:
         _STORE.save_session(sess)
         tr_any3 = state.get("trace")
         tr: Dict[str, Any] = tr_any3 if isinstance(tr_any3, dict) else {}
-        tr["storage"] = {"type": "sqlite", "db_path": _STORE.db_path}
+        tr["storage"] = _STORE.storage_meta()
         state["trace"] = cast(Dict[str, Any], tr)
     except Exception as e:
         raise RuntimeError(f"会话持久化失败：{type(e).__name__}: {e}") from e

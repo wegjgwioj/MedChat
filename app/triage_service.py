@@ -40,6 +40,11 @@ except Exception:
     from safety.record_guard import apply_record_conflicts_to_triage_json, detect_record_conflicts  # type: ignore
 
 try:
+    from .safety.conflict_judge import judge_json_conflicts  # type: ignore
+except Exception:
+    from safety.conflict_judge import judge_json_conflicts  # type: ignore
+
+try:
     # 你的项目里已有 rag/retriever.py
     from .rag import retriever as rag_retriever  # type: ignore
     from .rag.evidence_policy import is_low_evidence, summarize_evidence_quality  # type: ignore
@@ -213,16 +218,29 @@ def _apply_record_safety(answer_json: Dict[str, Any], clinical_record_text: str,
 
     serialized = json.dumps(answer_json or {}, ensure_ascii=False)
     conflicts = detect_record_conflicts(serialized, record_text)
-    if conflicts:
+    confirmed_conflicts, dismissed_conflicts = judge_json_conflicts(answer_json, conflicts)
+    if confirmed_conflicts:
         trace.append(
             {
                 "step": "record.safety",
                 "status": "conflict",
-                "count": len(conflicts),
-                "matched_terms": [str(item.get("matched_term") or "") for item in conflicts],
+                "count": len(confirmed_conflicts),
+                "matched_terms": [str(item.get("matched_term") or "") for item in confirmed_conflicts],
+                "dismissed_count": len(dismissed_conflicts),
             }
         )
-        return apply_record_conflicts_to_triage_json(answer_json, conflicts)
+        return apply_record_conflicts_to_triage_json(answer_json, confirmed_conflicts)
+
+    if dismissed_conflicts:
+        trace.append(
+            {
+                "step": "record.safety",
+                "status": "dismissed",
+                "count": 0,
+                "dismissed_count": len(dismissed_conflicts),
+            }
+        )
+        return apply_record_conflicts_to_triage_json(answer_json, [])
 
     trace.append({"step": "record.safety", "status": "ok", "count": 0})
     return answer_json

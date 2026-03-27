@@ -300,6 +300,43 @@ curl -sS "http://127.0.0.1:8000/v1/rag/retrieve" \
 }
 ~~~
 
+### 1.3 POST /v1/agent/chat_v2/stream（Agent Chat SSE）
+
+实现位置：
+
+- 路由：`agent_chat_v2_stream()`，见 [app/agent/router.py](../app/agent/router.py)
+- 业务：复用 `run_chat_v2_turn()`、通过 `StreamingResponse(text/event-stream)` 推送事件
+
+### 1.3.1 请求（JSON）
+
+- 请求体与 `AgentChatV2Request` 保持一致
+
+### 1.3.2 响应（SSE）
+
+事件集合：
+
+- `ack`：确认请求，返回 `request_id/status/session_id/request`，若链路已有 `trace_id` 会一并返回
+- `stage`：当前固定发送一次，表示后端已开始执行；载荷至少包含 `request_id/phase`
+- `final`：完整 `AgentChatV2Response`
+- `error`：异常时返回 `{request_id,code,message}`，若存在则附带 `trace_id`
+
+~~~text
+event: ack
+data: {"request_id":"abc","status":"accepted","session_id":"demo_s1","request":{"top_k":5,"top_n":30,"use_rerank":true}}
+
+event: stage
+data: {"request_id":"abc","phase":"running"}
+
+event: final
+data: {...AgentChatV2Response...}
+~~~
+
+### 1.3.3 兼容性
+
+- 仅保留 `/v1/agent/chat_v2/stream` 这一条 SSE 路径
+- SSE 优先调用；若流端点不可用、响应头异常或在 `final` 前断流，则回退 `/v1/agent/chat_v2` JSON
+- 现有脚本/自测仍可继续使用 JSON 接口
+
 ---
 
 ## 4) OCR 接口（MinerU）

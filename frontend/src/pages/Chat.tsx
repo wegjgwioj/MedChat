@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import EvidencePanel from '../components/EvidencePanel'
 import FollowUpPanel from '../components/FollowUpPanel'
 import DebugTrace from '../components/DebugTrace'
-import { chatV2, ocrIngest, ocrStatus } from '../lib/api'
+import { chatV2, chatV2Stream, ocrIngest, ocrStatus } from '../lib/api'
 import type { AgentChatV2Mode, AgentChatV2Response } from '../types/agent'
 
 type Role = 'user' | 'assistant'
@@ -133,6 +133,7 @@ export default function Chat() {
   const [messages, setMessages] = useState<UiMessage[]>([])
   const [input, setInput] = useState('')
   const [isSending, setIsSending] = useState(false)
+  const [streamPhase, setStreamPhase] = useState('')
 
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [topK, setTopK] = useState(5)
@@ -276,7 +277,25 @@ export default function Chat() {
         use_rerank: !!useRerank,
       }
 
-      const data = await chatV2(payload, { signal: ac.signal })
+      let data: AgentChatV2Response
+      try {
+        data = await chatV2Stream(
+          payload,
+          {
+            onAck: () => setStreamPhase('acknowledged'),
+            onStage: (stage) => setStreamPhase(stage.phase ?? 'running'),
+          },
+          { signal: ac.signal },
+        )
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        if (msg === 'STREAM_UNAVAILABLE') {
+          data = await chatV2(payload, { signal: ac.signal })
+        } else {
+          throw err
+        }
+      }
+
       updateSessionId(data.session_id)
 
       const nextQuestions = normalizeNonEmptyQuestions(data.next_questions)
@@ -321,6 +340,7 @@ export default function Chat() {
         isError: true,
       })
     } finally {
+      setStreamPhase('')
       setIsSending(false)
       inFlightRef.current = null
     }
@@ -580,6 +600,11 @@ export default function Chat() {
               <button className="sendBtn" onClick={() => void sendText(input)} disabled={isSending || !input.trim()}>
                 {isSending ? '发送中…' : '发送'}
               </button>
+              {streamPhase ? (
+                <div className="streamHint" style={{ marginTop: 4, fontSize: 12, color: '#888' }}>
+                  Stream ◦ {streamPhase}
+                </div>
+              ) : null}
             </div>
 
             {latestAssistant?.mode === 'ask' && ((latestAssistant?.questions?.length ?? 0) > 0 || (latestAssistant?.nextQuestions?.length ?? 0) > 0) ? (

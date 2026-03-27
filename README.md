@@ -148,6 +148,9 @@ npm run dev
 - `ALLOW_SAVE_SESSION_RAW_TEXT=1`：可选，落盘保存原文（不推荐，注意隐私）
 - `CHAT_SLOT_EXTRACTOR=rules`：可选，强制不用 LLM 抽槽（用于离线测试/稳定性）
 - `AGENT_SLOT_EXTRACTOR=rules`：可选，强制 `/v1/agent/chat_v2` 不用 LLM 抽槽（用于离线测试/CI）
+- `VITE_API_BASE_URL`：可选，替换 `frontend/src/lib/api.ts` 的接口地址
+- `/v1/agent/chat_v2/stream`：新增 SSE 端点，事件固定为 `ack/stage/final/error`，其中 `final` data 是完整 `AgentChatV2Response`
+- 前端优先走 SSE；如果流端点不可用、响应头不是 `text/event-stream`，或在收到 `final` 前断流，会自动回退 `/v1/agent/chat_v2` 同步 JSON 端点
 - `RAG_HYBRID_ENABLED=1`：可选，开启 dense+sparse 混合排序
 - `RAG_HYBRID_ALPHA=0.60`：可选，控制 hybrid 中 dense 权重
 - `RAG_CACHE_ENABLED=0|1`：可选，开启进程内语义缓存

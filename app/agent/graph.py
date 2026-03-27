@@ -9,11 +9,11 @@ M2：AgentOrchestration（LangGraph 多轮可追问问诊编排）。
 - N3 TriagePlanner：判断缺口 -> Ask 或 Answer
 - N4 RAGRetrieve：调用 M1 的 RAG（进程内）
 - N5 AnswerCompose：调用 LLM 生成带引用的回答
-- N6 PersistState：写入本地存储（SQLite）
+- N6 PersistState：写入 Redis 会话存储
 
 重要约束：
 - 不在日志中输出完整用户文本，最多前 100 字符或 hash。
-- LLM 不可用时必须能降级：使用规则抽取 + 模板回答。
+- 主链路必须保持单一路径执行，不做运行时降级或兼容回退。
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ from app.agent.prompts import (
     SLOT_EXTRACTION_SYSTEM,
     SLOT_EXTRACTION_USER_TEMPLATE,
 )
-from app.agent.storage import build_session_store
+from app.agent.storage import SessionStore, build_session_store
 from app.agent.state import AgentSessionState, Slots, build_summary_from_slots
 from app.privacy import redact_pii_for_llm
 from app.rag.evidence_policy import is_low_evidence, summarize_evidence_quality
@@ -80,8 +80,15 @@ class AgentGraphState(TypedDict, total=False):
     trace: Dict[str, Any]
 
 
-_STORE = build_session_store()
+_STORE: Optional[SessionStore] = None
 _GRAPH = None
+
+
+def _get_store() -> SessionStore:
+    global _STORE
+    if _STORE is None:
+        _STORE = build_session_store()
+    return _STORE
 
 
 def _sha256_text(text: str) -> str:
@@ -497,7 +504,7 @@ def _normalize_department(dept: Optional[str]) -> Optional[str]:
 
 
 def _rule_extract_slots(user_message: str) -> Slots:
-    """LLM 失败时的规则兜底抽取。"""
+    """规则槽位抽取实现，仅供测试替身或离线打桩使用。"""
 
     msg = (user_message or "").strip()
     out = Slots()
@@ -599,8 +606,7 @@ def _rule_extract_slots(user_message: str) -> Slots:
 def _call_llm_text(system: str, user: str) -> str:
     """统一的 LLM 调用封装（DeepSeek/OpenAI 兼容）。
 
-    注意：
-    - 该函数可能抛异常；上层必须捕获并降级。
+    注意：该函数失败时直接抛异常，由主链路 fail-fast。
     """
 
     try:
@@ -867,18 +873,7 @@ def _node_memory_update(state: AgentGraphState) -> Dict[str, Any]:
     # ===== 批次1新增：记录更新前的槽位 =====
     old_slots = sess.slots.model_dump()
 
-    # 抽取策略：优先 LLM，失败则规则兜底；支持强制 rules（用于离线自测/CI）
-    patch_slots: Slots
-    forced = str(os.getenv("AGENT_SLOT_EXTRACTOR", "auto")).strip().lower()
-    if forced == "rules":
-        patch_slots = _rule_extract_slots(msg)
-    else:
-        try:
-            patch_slots = _extract_slots_with_llm(msg)
-        except Exception as e:
-            if _env_flag("RAG_DEBUG", "0"):
-                logger.warning("[Agent] 槽位抽取降级为规则：%s", str(e))
-            patch_slots = _rule_extract_slots(msg)
+    patch_slots = _extract_slots_with_llm(msg)
 
     sess.slots = sess.slots.merge_from_partial(patch_slots)
 
@@ -1004,57 +999,40 @@ def _node_rag_retrieve(state: AgentGraphState) -> Dict[str, Any]:
     dept = sess.slots.department_guess
 
     # 调用 M1：必须走兼容层 app.rag.retriever.retrieve
-    evidence: List[Dict[str, Any]]
-    try:
-        from app.rag.retriever import get_last_retrieval_meta as rag_get_last_retrieval_meta  # type: ignore
-        from app.rag.retriever import retrieve as rag_retrieve  # type: ignore
-        from app.rag.rag_core import get_stats  # type: ignore
+    from app.rag.retriever import get_last_retrieval_meta as rag_get_last_retrieval_meta  # type: ignore
+    from app.rag.retriever import retrieve as rag_retrieve  # type: ignore
+    from app.rag.rag_core import get_stats  # type: ignore
 
-        rag_t0 = _now_ms()
-        evidence = cast(
-            List[Dict[str, Any]],
-            rag_retrieve(
+    rag_t0 = _now_ms()
+    evidence = cast(
+        List[Dict[str, Any]],
+        rag_retrieve(
             rag_query,
             top_k=top_k,
             top_n=top_n,
             department=dept,
             use_rerank=use_rerank,
-            ),
-        )
-        rag_latency_ms = int((_now_ms() - rag_t0) * 1000)
-        rag_meta = rag_get_last_retrieval_meta()
+        ),
+    )
+    rag_latency_ms = int((_now_ms() - rag_t0) * 1000)
+    rag_meta = rag_get_last_retrieval_meta()
 
-        st = get_stats()
-        tr_any = state.get("trace")
-        tr: Dict[str, Any] = tr_any if isinstance(tr_any, dict) else {}
-        tr["rag_stats"] = {
-            "device": st.device,
-            "collection": st.collection,
-            "count": st.count,
-            "hits": len(evidence or []),
-            "latency_ms": rag_latency_ms,
-            "evidence_quality": summarize_evidence_quality(evidence),
-        }
-        if isinstance(rag_meta, dict):
-            for key in ("cache_hit", "cache_mode", "hybrid_enabled", "search_query"):
-                if key in rag_meta:
-                    tr["rag_stats"][key] = rag_meta.get(key)
-        state["trace"] = cast(Dict[str, Any], tr)
-
-    except Exception as e:
-        # RAG 失败不能直接崩：退化为无证据回答
-        if _env_flag("RAG_DEBUG", "0"):
-            logger.warning("[Agent] RAG 检索失败：%s", str(e))
-        evidence = []
-        tr_any2 = state.get("trace")
-        tr = tr_any2 if isinstance(tr_any2, dict) else {}
-        tr["rag_stats"] = {
-            "hits": 0,
-            "latency_ms": 0,
-            "evidence_quality": summarize_evidence_quality([]),
-        }
-        tr["rag_error"] = f"{type(e).__name__}: {e}"
-        state["trace"] = cast(Dict[str, Any], tr)
+    st = get_stats()
+    tr_any = state.get("trace")
+    tr: Dict[str, Any] = tr_any if isinstance(tr_any, dict) else {}
+    tr["rag_stats"] = {
+        "device": st.device,
+        "collection": st.collection,
+        "count": st.count,
+        "hits": len(evidence or []),
+        "latency_ms": rag_latency_ms,
+        "evidence_quality": summarize_evidence_quality(evidence),
+    }
+    if isinstance(rag_meta, dict):
+        for key in ("cache_hit", "cache_mode", "hybrid_enabled", "search_query"):
+            if key in rag_meta:
+                tr["rag_stats"][key] = rag_meta.get(key)
+    state["trace"] = cast(Dict[str, Any], tr)
 
     _trace_end(state, node, t0)
     return {"evidence": evidence}
@@ -1125,24 +1103,13 @@ def _node_answer_compose(state: AgentGraphState) -> Dict[str, Any]:
     user_msg = str(state.get("user_message") or "").strip()
     summary = sess.summary
 
-    try:
-        user_prompt = ANSWER_USER_TEMPLATE.format(
-            user_message=redact_pii_for_llm(user_msg),
-            summary=summary or "(无)",
-            evidence_block=evidence_block or "(无)",
-        )
-        text = _call_llm_text(ANSWER_SYSTEM, user_prompt)
-        ans = (text or "").strip()
-    except Exception as e:
-        if _env_flag("RAG_DEBUG", "0"):
-            logger.warning("[Agent] LLM 回答失败，退化为模板：%s", str(e))
-        ans = (
-            "我根据检索到的资料做了初步整理：\n"
-            "- 你可以先关注：症状变化、是否出现持续高热/呼吸困难等危险信号。\n"
-            "- 若症状持续或加重，建议尽快线下就医。\n\n"
-            "引用：[E1]\n"
-            "免责声明：本回答仅供信息参考，不能替代医生面诊。"
-        )
+    user_prompt = ANSWER_USER_TEMPLATE.format(
+        user_message=redact_pii_for_llm(user_msg),
+        summary=summary or "(无)",
+        evidence_block=evidence_block or "(无)",
+    )
+    text = _call_llm_text(ANSWER_SYSTEM, user_prompt)
+    ans = (text or "").strip()
 
     conflicts = detect_record_conflicts(ans, sess.record_summary or build_record_summary_from_slots(sess.slots))
     confirmed_conflicts, dismissed_conflicts = judge_text_conflicts(ans, conflicts)
@@ -1173,10 +1140,11 @@ def _node_persist_state(state: AgentGraphState) -> Dict[str, Any]:
         raise RuntimeError("PersistState: session 缺失")
 
     try:
-        _STORE.save_session(sess)
+        store = _get_store()
+        store.save_session(sess)
         tr_any3 = state.get("trace")
         tr: Dict[str, Any] = tr_any3 if isinstance(tr_any3, dict) else {}
-        tr["storage"] = _STORE.storage_meta()
+        tr["storage"] = store.storage_meta()
         state["trace"] = cast(Dict[str, Any], tr)
     except Exception as e:
         raise RuntimeError(f"会话持久化失败：{type(e).__name__}: {e}") from e
@@ -1242,7 +1210,7 @@ def load_or_create_session(session_id: Optional[str] = None) -> AgentSessionStat
     if not sid:
         sid = str(uuid4())
 
-    st = _STORE.load_session(sid)
+    st = _get_store().load_session(sid)
     if st is not None:
         return st
 

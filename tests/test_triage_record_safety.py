@@ -43,7 +43,10 @@ def _install_fake_engine(monkeypatch):
 
 
 def test_triage_once_with_clinical_record_filters_unsafe_drug_action(monkeypatch, tmp_path):
+    import app.safety.conflict_judge as conflict_judge
+
     triage_service = _install_fake_engine(monkeypatch)
+    monkeypatch.setattr(conflict_judge, "_predict_conflict_scores", lambda premise, hypotheses: [0.95 for _ in hypotheses])
 
     record_path = tmp_path / "record.txt"
     record_path.write_text("过敏：青霉素过敏", encoding="utf-8")
@@ -60,7 +63,10 @@ def test_triage_once_with_clinical_record_filters_unsafe_drug_action(monkeypatch
 
 
 def test_triage_once_records_record_conflicts_in_trace(monkeypatch, tmp_path):
+    import app.safety.conflict_judge as conflict_judge
+
     triage_service = _install_fake_engine(monkeypatch)
+    monkeypatch.setattr(conflict_judge, "_predict_conflict_scores", lambda premise, hypotheses: [0.95 for _ in hypotheses])
 
     record_path = tmp_path / "record.txt"
     record_path.write_text("过敏：青霉素过敏", encoding="utf-8")
@@ -77,6 +83,7 @@ def test_triage_once_records_record_conflicts_in_trace(monkeypatch, tmp_path):
 
 def test_triage_once_does_not_treat_negative_warning_fields_as_positive_conflict(monkeypatch, tmp_path):
     from app import triage_service
+    import app.safety.conflict_judge as conflict_judge
 
     engine = triage_service.TriageEngine()
     monkeypatch.setattr(engine, "init", lambda: None)
@@ -99,6 +106,7 @@ def test_triage_once_does_not_treat_negative_warning_fields_as_positive_conflict
     )
     monkeypatch.setattr(engine, "run_safety_chain", lambda answer_json, evidence_block, evidence_list, trace=None: answer_json)
     monkeypatch.setattr(triage_service, "_ENGINE", engine, raising=False)
+    monkeypatch.setattr(conflict_judge, "_predict_conflict_scores", lambda premise, hypotheses: [0.05 for _ in hypotheses])
 
     record_path = tmp_path / "record.txt"
     record_path.write_text("过敏：青霉素过敏", encoding="utf-8")

@@ -4,12 +4,11 @@ from __future__ import annotations
 
 
 def test_memory_update_builds_record_summary(monkeypatch, tmp_path):
-    monkeypatch.setenv("AGENT_SLOT_EXTRACTOR", "rules")
-
     from app.agent import graph
     from app.agent.state import AgentSessionState
     from app.agent.storage_sqlite import SqliteSessionStore
 
+    monkeypatch.setattr(graph, "_extract_slots_with_llm", graph._rule_extract_slots)
     monkeypatch.setattr(graph, "_STORE", SqliteSessionStore(tmp_path / "agent_sessions.sqlite3"), raising=False)
 
     state = {
@@ -30,12 +29,14 @@ def test_memory_update_builds_record_summary(monkeypatch, tmp_path):
 def test_answer_compose_applies_record_conflict_warning(monkeypatch):
     from app.agent import graph
     from app.agent.state import AgentSessionState
+    import app.safety.conflict_judge as conflict_judge
 
     monkeypatch.setattr(
         graph,
         "_call_llm_text",
         lambda system, user: "建议先口服阿莫西林。[E1]\n\n引用：[E1]\n免责声明：本回答仅供信息参考，不能替代医生面诊。",
     )
+    monkeypatch.setattr(conflict_judge, "_predict_conflict_scores", lambda premise, hypotheses: [0.95 for _ in hypotheses])
 
     sess = AgentSessionState(
         session_id="s-record-2",
@@ -64,12 +65,14 @@ def test_answer_compose_applies_record_conflict_warning(monkeypatch):
 def test_answer_compose_does_not_flag_negative_warning_context(monkeypatch):
     from app.agent import graph
     from app.agent.state import AgentSessionState
+    import app.safety.conflict_judge as conflict_judge
 
     monkeypatch.setattr(
         graph,
         "_call_llm_text",
         lambda system, user: "你对青霉素过敏，因此应避免阿莫西林。[E1]\n\n引用：[E1]\n免责声明：本回答仅供信息参考，不能替代医生面诊。",
     )
+    monkeypatch.setattr(conflict_judge, "_predict_conflict_scores", lambda premise, hypotheses: [0.05 for _ in hypotheses])
 
     sess = AgentSessionState(
         session_id="s-record-3",

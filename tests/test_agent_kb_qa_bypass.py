@@ -1,9 +1,47 @@
+from types import SimpleNamespace
+
 from fastapi.testclient import TestClient
 
 
+def _patch_kb_qa_runtime(monkeypatch):
+    import app.agent.graph as graph
+    import app.rag.retriever as retriever
+    import app.rag.rag_core as rag_core
+
+    graph._GRAPH = None
+    monkeypatch.setattr(graph, "_extract_slots_with_llm", graph._rule_extract_slots)
+    monkeypatch.setattr(
+        retriever,
+        "retrieve",
+        lambda *args, **kwargs: [
+            {
+                "eid": "E1",
+                "text": "风疹可经飞沫传播。",
+                "source": "kb.md",
+                "chunk_id": "kb:1",
+                "score": 0.12,
+                "rerank_score": 0.88,
+                "metadata": {"department": "传染科", "title": "风疹", "row": 1, "source_file": "kb.md"},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        rag_core,
+        "get_stats",
+        lambda: SimpleNamespace(
+            device="cpu",
+            collection="pytest",
+            count=1,
+            persist_dir="pytest",
+            embed_model="pytest",
+            rerank_model=None,
+            updated_at="",
+        ),
+    )
+
+
 def test_agent_kb_question_bypasses_followups(monkeypatch):
-    # Offline deterministic
-    monkeypatch.setenv("AGENT_SLOT_EXTRACTOR", "rules")
+    _patch_kb_qa_runtime(monkeypatch)
 
     from app.api_server import app
 
@@ -67,7 +105,7 @@ def test_personal_symptom_not_kb_question(monkeypatch):
 
 def test_trace_contains_kb_qa_stats(monkeypatch):
     """测试 trace 包含 kb_qa_stats"""
-    monkeypatch.setenv("AGENT_SLOT_EXTRACTOR", "rules")
+    _patch_kb_qa_runtime(monkeypatch)
 
     from fastapi.testclient import TestClient
     from app.api_server import app

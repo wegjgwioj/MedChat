@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Redis 会话存储。可选依赖；未安装或连不上时由工厂决定是否回退。"""
+"""Redis 会话存储（唯一后端）。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ from app.agent.state import AgentSessionState, utc_now_iso
 class RedisSessionStore:
     def __init__(self, redis_url: str, key_prefix: str = "medchat:session:", client: Any = None):
         self._redis_url = str(redis_url or "").strip()
+        if not self._redis_url:
+            raise RuntimeError("redis_url 不能为空")
         self._key_prefix = str(key_prefix or "medchat:session:").strip() or "medchat:session:"
         self._client = client or self._create_client(self._redis_url)
         try:

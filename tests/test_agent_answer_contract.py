@@ -130,7 +130,10 @@ def test_duplicate_citation_in_text_not_duplicated(monkeypatch):
 
 def test_trace_contains_slots_changed(monkeypatch):
     """测试 trace 包含 slots_changed 字段"""
-    monkeypatch.setenv("AGENT_SLOT_EXTRACTOR", "rules")
+    import app.agent.graph as graph
+
+    graph._GRAPH = None
+    monkeypatch.setattr(graph, "_extract_slots_with_llm", graph._rule_extract_slots)
 
     from fastapi.testclient import TestClient
     from app.api_server import app

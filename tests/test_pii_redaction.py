@@ -113,10 +113,11 @@ def test_agent_slot_extraction_redacts_user_text_before_llm(monkeypatch) -> None
 def test_agent_answer_compose_redacts_user_text_before_llm(monkeypatch, tmp_path) -> None:
     import app.agent.graph as graph
     import app.rag.retriever as retriever
+    import app.rag.rag_core as rag_core
     from app.agent.storage_sqlite import SqliteSessionStore
 
     graph._GRAPH = None
-    monkeypatch.setenv("AGENT_SLOT_EXTRACTOR", "rules")
+    monkeypatch.setattr(graph, "_extract_slots_with_llm", graph._rule_extract_slots)
     monkeypatch.setattr(graph, "_STORE", SqliteSessionStore(Path(tmp_path) / "agent.sqlite3"))
 
     captured = {}
@@ -149,6 +150,19 @@ def test_agent_answer_compose_redacts_user_text_before_llm(monkeypatch, tmp_path
 
     monkeypatch.setattr(graph, "_call_llm_text", fake_call_llm_text)
     monkeypatch.setattr(retriever, "retrieve", fake_retrieve)
+    monkeypatch.setattr(
+        rag_core,
+        "get_stats",
+        lambda: types.SimpleNamespace(
+            device="cpu",
+            collection="pytest",
+            count=2,
+            persist_dir="pytest",
+            embed_model="pytest",
+            rerank_model=None,
+            updated_at="",
+        ),
+    )
 
     out = graph.run_chat_v2_turn(
         session_id="pii-answer-session",

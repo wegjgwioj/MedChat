@@ -3,8 +3,6 @@ from types import SimpleNamespace
 
 
 def test_triage_payload_marks_low_evidence_and_adds_followups(monkeypatch):
-    monkeypatch.setenv("AGENT_SLOT_EXTRACTOR", "rules")
-
     from app.triage_service import _normalize_answer_schema, triage_step_build_payload
 
     evidence = [
@@ -50,14 +48,14 @@ def test_triage_payload_marks_low_evidence_and_adds_followups(monkeypatch):
 
 
 def test_agent_chat_v2_low_evidence_skips_llm_and_returns_cautious_answer(monkeypatch, tmp_path):
-    monkeypatch.setenv("AGENT_SLOT_EXTRACTOR", "rules")
-
     from app.agent.graph import run_chat_v2_turn
     import app.agent.graph as graph
     import app.rag.retriever as retriever
+    import app.rag.rag_core as rag_core
     from app.agent.storage_sqlite import SqliteSessionStore
 
     graph._GRAPH = None
+    monkeypatch.setattr(graph, "_extract_slots_with_llm", graph._rule_extract_slots)
     monkeypatch.setattr(graph, "_STORE", SqliteSessionStore(Path(tmp_path) / "agent.sqlite3"))
 
     calls = {"llm": 0}
@@ -81,6 +79,19 @@ def test_agent_chat_v2_low_evidence_skips_llm_and_returns_cautious_answer(monkey
 
     monkeypatch.setattr(graph, "_call_llm_text", fake_llm)
     monkeypatch.setattr(retriever, "retrieve", fake_retrieve)
+    monkeypatch.setattr(
+        rag_core,
+        "get_stats",
+        lambda: SimpleNamespace(
+            device="cpu",
+            collection="pytest",
+            count=1,
+            persist_dir="pytest",
+            embed_model="pytest",
+            rerank_model=None,
+            updated_at="",
+        ),
+    )
 
     out = run_chat_v2_turn(
         session_id="low-evidence-session",
@@ -143,14 +154,14 @@ def test_triage_retrieve_trace_includes_rag_cache_meta(monkeypatch):
 
 
 def test_agent_trace_includes_rag_cache_meta(monkeypatch, tmp_path):
-    monkeypatch.setenv("AGENT_SLOT_EXTRACTOR", "rules")
-
     from app.agent.graph import run_chat_v2_turn
     import app.agent.graph as graph
     import app.rag.retriever as retriever
+    import app.rag.rag_core as rag_core
     from app.agent.storage_sqlite import SqliteSessionStore
 
     graph._GRAPH = None
+    monkeypatch.setattr(graph, "_extract_slots_with_llm", graph._rule_extract_slots)
     monkeypatch.setattr(graph, "_STORE", SqliteSessionStore(Path(tmp_path) / "agent-meta.sqlite3"))
     monkeypatch.setattr(
         retriever,
@@ -190,6 +201,19 @@ def test_agent_trace_includes_rag_cache_meta(monkeypatch, tmp_path):
         graph,
         "_call_llm_text",
         lambda *args, **kwargs: "建议先补液休息，若呼吸困难加重请尽快就医。[E1][E2]\n\n引用：[E1][E2]\n免责声明：本回答仅供信息参考，不能替代医生面诊。",
+    )
+    monkeypatch.setattr(
+        rag_core,
+        "get_stats",
+        lambda: SimpleNamespace(
+            device="cpu",
+            collection="pytest",
+            count=2,
+            persist_dir="pytest",
+            embed_model="pytest",
+            rerank_model=None,
+            updated_at="",
+        ),
     )
 
     out = run_chat_v2_turn(

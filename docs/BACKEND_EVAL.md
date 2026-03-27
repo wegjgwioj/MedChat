@@ -38,6 +38,12 @@
 
 - [app/MedDG_UTF8](../app/MedDG_UTF8)
 
+说明：
+
+- `eval_meddg_e2e.py` 与 `eval_rag_quality.py` 默认会解析 `app/MedDG_UTF8/<split>.pk`。
+- 若默认路径不存在，可显式传 `--meddg_path <absolute_or_relative_path>`。
+- 若两者都不可用，脚本会直接报出缺失文件路径，不再等到 pickle 打开阶段才失败。
+
 硬性要求（已在脚本里实现）：
 
 - 所有评测脚本运行时必须先打印：
@@ -91,6 +97,32 @@ python -m uvicorn app.api_server:app --host 0.0.0.0 --port 8000
 
 ---
 
+## 3.3 统一入口（推荐）
+
+脚本：
+
+- [scripts/eval_run_all.py](../scripts/eval_run_all.py)
+
+用途：
+
+- 顺序执行 Agent v2、RAG、Perf 三类评测脚本
+- 汇总 `meddg_eval_summary.json`、`rag_eval_summary.json`、`perf_eval.json`
+- 生成单一入口产物 `reports/eval_suite_summary.json`
+
+PowerShell：
+
+~~~powershell
+python scripts/eval_run_all.py --meddg_path app/MedDG_UTF8/test.pk --base_url http://127.0.0.1:8000 --out_dir reports
+~~~
+
+可选跳过：
+
+~~~powershell
+python scripts/eval_run_all.py --meddg_path app/MedDG_UTF8/test.pk --base_url http://127.0.0.1:8000 --skip_perf
+~~~
+
+---
+
 ## 4. 评测一：端到端（Agent v2，多轮回放）
 
 脚本：
@@ -102,19 +134,25 @@ python -m uvicorn app.api_server:app --host 0.0.0.0 --port 8000
 PowerShell：
 
 ~~~powershell
-python scripts/eval_meddg_e2e.py --base_url http://127.0.0.1:8000 --split test --limit 50 --top_k 5 --top_n 30 --use_rerank
+python scripts/eval_meddg_e2e.py --base_url http://127.0.0.1:8000 --split test --limit 50 --top_k 5 --top_n 30 --use_rerank 1
 ~~~
 
 bash：
 
 ~~~bash
-python scripts/eval_meddg_e2e.py --base_url http://127.0.0.1:8000 --split test --limit 50 --top_k 5 --top_n 30 --use_rerank
+python scripts/eval_meddg_e2e.py --base_url http://127.0.0.1:8000 --split test --limit 50 --top_k 5 --top_n 30 --use_rerank 1
 ~~~
 
 ### 4.2 产物
 
 - `reports/meddg_eval_cases.csv`
 - `reports/cases.csv`（别名）
+- `reports/meddg_eval_summary.json`
+
+新增关注字段：
+
+- case CSV：`evidence_quality_level`、`evidence_quality_reason`
+- summary JSON：`evidence_quality_counts`、`low_evidence_rate`
 
 ### 4.3 指标模板（自行填充）
 
@@ -152,19 +190,25 @@ python scripts/eval_meddg_e2e.py --base_url http://127.0.0.1:8000 --split test -
 PowerShell：
 
 ~~~powershell
-python scripts/eval_rag_quality.py --base_url http://127.0.0.1:8000 --split test --limit 200 --top_k 5 --top_n 30 --use_rerank
+python scripts/eval_rag_quality.py --base_url http://127.0.0.1:8000 --split test --limit 200 --top_k 5 --top_n 30 --use_rerank 1
 ~~~
 
 bash：
 
 ~~~bash
-python scripts/eval_rag_quality.py --base_url http://127.0.0.1:8000 --split test --limit 200 --top_k 5 --top_n 30 --use_rerank
+python scripts/eval_rag_quality.py --base_url http://127.0.0.1:8000 --split test --limit 200 --top_k 5 --top_n 30 --use_rerank 1
 ~~~
 
 ### 5.2 产物
 
 - `reports/rag_eval_details.csv`
 - `reports/details.csv`（别名）
+- `reports/rag_eval_summary.json`
+
+新增关注字段：
+
+- details CSV：`evidence_quality_level`、`evidence_quality_reason`
+- summary JSON：`evidence_quality_counts`、`low_evidence_rate`
 
 ### 5.3 指标模板（自行填充）
 
@@ -172,9 +216,12 @@ python scripts/eval_rag_quality.py --base_url http://127.0.0.1:8000 --split test
   - 有 evidence 的比例：
   - 平均 evidence 条数：
   - rerank 启用/禁用对比（两次运行对照）：
+  - 阈值过滤对比（建议至少对照一组 `RAG_RERANK_MIN_SCORE` / `RAG_VECTOR_MAX_SCORE`）：
+  - 低证据比例（返回 evidence 条数 < `RAG_MIN_EVIDENCE`）：
 
 - 契约一致性：
   - evidence item 必填字段缺失次数（eid/text/source/chunk_id）：
+  - evidence 被阈值过滤后仍返回的比例：
 
 契约证据：见单测 [tests/test_rag_retrieve_contract.py](../tests/test_rag_retrieve_contract.py)。
 

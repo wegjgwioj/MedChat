@@ -30,13 +30,36 @@ except Exception:
     from triage_protocol import build_triage_payload  # type: ignore
 
 try:
+    from .privacy import redact_pii_for_llm  # type: ignore
+except Exception:
+    from privacy import redact_pii_for_llm  # type: ignore
+
+try:
+    from .safety.record_guard import apply_record_conflicts_to_triage_json, detect_record_conflicts  # type: ignore
+except Exception:
+    from safety.record_guard import apply_record_conflicts_to_triage_json, detect_record_conflicts  # type: ignore
+
+try:
+    from .safety.conflict_judge import judge_json_conflicts  # type: ignore
+except Exception:
+    from safety.conflict_judge import judge_json_conflicts  # type: ignore
+
+try:
     # 你的项目里已有 rag/retriever.py
     from .rag import retriever as rag_retriever  # type: ignore
+    from .rag.evidence_policy import is_low_evidence, summarize_evidence_quality  # type: ignore
 except Exception:
     try:
         from rag import retriever as rag_retriever  # type: ignore
+        from rag.evidence_policy import is_low_evidence, summarize_evidence_quality  # type: ignore
     except Exception:
         rag_retriever = None
+        def summarize_evidence_quality(evidence_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+            count = len(evidence_list or [])
+            return {"level": "none" if count <= 0 else "ok", "reason": "fallback", "count": count}
+
+        def is_low_evidence(summary: Dict[str, Any]) -> bool:
+            return str((summary or {}).get("level") or "").strip().lower() in {"low", "none"}
 
 
 logger = logging.getLogger(__name__)
@@ -178,6 +201,59 @@ def _apply_guardrails(answer_json: Dict[str, Any], evidence_list: List[Dict[str,
     return out
 
 
+def _append_uncertainty_tag(text: str, tag: str) -> str:
+    parts = [p.strip() for p in str(text or "").split("|") if p.strip()]
+    if tag not in parts:
+        parts.append(tag)
+    return " | ".join(parts)
+
+
+def _apply_record_safety(answer_json: Dict[str, Any], clinical_record_text: str, trace: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    if trace is None:
+        trace = []
+
+    record_text = str(clinical_record_text or "").strip()
+    if not record_text:
+        return answer_json
+
+    serialized = json.dumps(answer_json or {}, ensure_ascii=False)
+    conflicts = detect_record_conflicts(serialized, record_text)
+    confirmed_conflicts, dismissed_conflicts = judge_json_conflicts(answer_json, conflicts)
+    if confirmed_conflicts:
+        trace.append(
+            {
+                "step": "record.safety",
+                "status": "conflict",
+                "count": len(confirmed_conflicts),
+                "matched_terms": [str(item.get("matched_term") or "") for item in confirmed_conflicts],
+                "dismissed_count": len(dismissed_conflicts),
+            }
+        )
+        return apply_record_conflicts_to_triage_json(answer_json, confirmed_conflicts)
+
+    if dismissed_conflicts:
+        trace.append(
+            {
+                "step": "record.safety",
+                "status": "dismissed",
+                "count": 0,
+                "dismissed_count": len(dismissed_conflicts),
+            }
+        )
+        return apply_record_conflicts_to_triage_json(answer_json, [])
+
+    trace.append({"step": "record.safety", "status": "ok", "count": 0})
+    return answer_json
+
+
+def _default_low_evidence_questions() -> List[str]:
+    return [
+        "症状从什么时候开始，是持续存在还是间断发作？",
+        "除了当前不适外，是否还有发热、呼吸困难、胸痛、呕吐或意识改变等伴随症状？",
+        "你的年龄、基础病、正在使用的药物和过敏情况分别是什么？",
+    ]
+
+
 def _format_evidence_block(evidence_list: List[Dict[str, Any]]) -> str:
     lines = []
     for ev in (evidence_list or []):
@@ -271,17 +347,21 @@ def _normalize_answer_schema(answer: Any, evidence_list: List[Dict[str, Any]]) -
 
     # 如果有证据但完全没引用，打一个标记，方便上层触发重写
     if evidence_list and len(normalized["citations_used"]) < 1:
-        if normalized["uncertainty"]:
-            normalized["uncertainty"] = f"{normalized['uncertainty']} | insufficient_citations"
-        else:
-            normalized["uncertainty"] = "insufficient_citations"
+        normalized["uncertainty"] = _append_uncertainty_tag(normalized.get("uncertainty", ""), "insufficient_citations")
 
     # 若没有本地证据，也标记一下
     if not evidence_list:
-        if normalized["uncertainty"]:
-            normalized["uncertainty"] = f"{normalized['uncertainty']} | no_local_evidence"
-        else:
-            normalized["uncertainty"] = "no_local_evidence"
+        normalized["uncertainty"] = _append_uncertainty_tag(normalized.get("uncertainty", ""), "no_local_evidence")
+
+    evidence_quality = summarize_evidence_quality(evidence_list)
+    if is_low_evidence(evidence_quality):
+        normalized["uncertainty"] = _append_uncertainty_tag(normalized.get("uncertainty", ""), "low_local_evidence")
+        if not normalized["key_questions"]:
+            normalized["key_questions"] = _default_low_evidence_questions()
+        reasoning = str(normalized.get("reasoning") or "").strip()
+        prefix = "本地证据较少，以下判断仅作初步参考。"
+        if prefix not in reasoning:
+            normalized["reasoning"] = f"{prefix} {reasoning}".strip()
 
     # 确定性 guardrails v2：triage_level 下限提升 + citations_used 重算
     return _apply_guardrails(normalized, evidence_list=evidence_list)
@@ -515,8 +595,24 @@ class TriageEngine:
             t0 = time.perf_counter()
             try:
                 evidence_list = rag_retriever.retrieve(rag_query, top_k=top_k)
+                rag_meta_getter = getattr(rag_retriever, "get_last_retrieval_meta", None)
+                rag_meta = rag_meta_getter() if callable(rag_meta_getter) else {}
                 rag_status = "ok"
-                self._trace_step(trace, "rag.retrieve", "ok", t0, top_k=top_k, n_evidence=len(evidence_list))
+                trace_info: Dict[str, Any] = {"top_k": top_k, "n_evidence": len(evidence_list)}
+                if isinstance(rag_meta, dict):
+                    for key in ("cache_hit", "cache_mode", "hybrid_enabled", "search_query"):
+                        if key in rag_meta:
+                            trace_info[key] = rag_meta.get(key)
+                self._trace_step(trace, "rag.retrieve", "ok", t0, **trace_info)
+                quality = summarize_evidence_quality(evidence_list)
+                trace.append(
+                    {
+                        "step": "rag.evidence_quality",
+                        "status": str(quality.get("level") or "unknown"),
+                        "count": int(quality.get("count") or 0),
+                        "reason": str(quality.get("reason") or ""),
+                    }
+                )
             except Exception as e:
                 rag_status = "error"
                 try:
@@ -540,6 +636,15 @@ class TriageEngine:
                     n_evidence=0,
                     error_type=type(e).__name__,
                 )
+                quality = summarize_evidence_quality(evidence_list)
+                trace.append(
+                    {
+                        "step": "rag.evidence_quality",
+                        "status": str(quality.get("level") or "unknown"),
+                        "count": int(quality.get("count") or 0),
+                        "reason": str(quality.get("reason") or ""),
+                    }
+                )
         else:
             evidence_list = []
             rag_status = "disabled"
@@ -551,6 +656,15 @@ class TriageEngine:
                     "top_k": top_k,
                     "n_evidence": 0,
                     "error_type": "RAG_DISABLED",
+                }
+            )
+            quality = summarize_evidence_quality(evidence_list)
+            trace.append(
+                {
+                    "step": "rag.evidence_quality",
+                    "status": str(quality.get("level") or "unknown"),
+                    "count": int(quality.get("count") or 0),
+                    "reason": str(quality.get("reason") or ""),
                 }
             )
 
@@ -569,7 +683,7 @@ class TriageEngine:
         t0 = time.perf_counter()
         raw = self.chain_suggest.run(
             {
-                "user_text": (user_text or "").strip(),
+                "user_text": redact_pii_for_llm((user_text or "").strip()),
                 "date": datetime.now(),
                 "evidence": evidence_block,
             }
@@ -818,6 +932,8 @@ class TriageEngine:
                 trace=trace,
             )
 
+        answer_json = _apply_record_safety(answer_json, clinical_record_text, trace=trace)
+
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return TriageResult(
             answer_json=answer_json,
@@ -873,6 +989,7 @@ def triage_once(
     meta = payload.get("meta")
     if isinstance(meta, dict):
         meta["rag_status"] = result.rag_status
+        meta["evidence_quality"] = summarize_evidence_quality(result.evidence)
         if isinstance(result.rag_error, dict) and result.rag_error:
             meta["rag_error"] = result.rag_error
         # 可观测性：工具化步骤轨迹（不包含原始文本）
@@ -983,6 +1100,7 @@ def triage_step_build_payload(
     meta = payload.get("meta")
     if isinstance(meta, dict):
         meta["rag_status"] = rag_status
+        meta["evidence_quality"] = summarize_evidence_quality(evidence_list)
         if isinstance(rag_error, dict) and rag_error:
             meta["rag_error"] = rag_error
         if isinstance(trace, list) and trace:

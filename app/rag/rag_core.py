@@ -16,7 +16,12 @@ M1：RAGService 核心实现（进程内直连版本）。
 from __future__ import annotations
 
 import hashlib
+import math
+import re
 import threading
+import time
+from collections import OrderedDict
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +39,7 @@ from app.rag.utils.rag_shared import (
     resolve_persist_dir,
     resolve_embedding_device,
 )
+from app.privacy import redact_pii_for_llm
 
 
 @dataclass(frozen=True)
@@ -47,13 +53,28 @@ class RagStats:
     updated_at: str
 
 
+@dataclass
+class _CacheEntry:
+    cache_key: str
+    request_key: str
+    normalized_query: str
+    query_tokens: Tuple[str, ...]
+    created_at: float
+    expires_at: float
+    items: List[Dict[str, Any]]
+
+
 _embed_lock = threading.Lock()
 _rerank_lock = threading.Lock()
 _vs_lock = threading.Lock()
+_cache_lock = threading.Lock()
+_runtime_lock = threading.Lock()
 
 _cached_embed: Optional[Tuple[Any, EmbeddingInfo]] = None
 _cached_reranker: Optional[Any] = None
 _cached_vs: Optional[Any] = None
+_retrieval_cache: "OrderedDict[str, _CacheEntry]" = OrderedDict()
+_last_retrieval_meta: Dict[str, Any] = {}
 
 
 def _sha256_text(text: str) -> str:
@@ -76,22 +97,19 @@ def _rewrite_query_slimming(query: str) -> str:
     """
     try:
         import os
-        from openai import OpenAI
+        import openai  # openai==0.28.x
 
-        # 1. 初始化 DeepSeek 客户端
-        client = OpenAI(
-            api_key=os.getenv("DEEPSEEK_API_KEY"),
-            base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-        )
+        openai.api_key = os.getenv("DEEPSEEK_API_KEY")
+        openai.api_base = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 
         # 2. 读取prompt模板
         from app.agent.prompts import QUERY_SLIMMING_SYSTEM, QUERY_SLIMMING_USER_TEMPLATE
 
         # 3. 构造用户消息
-        user_message = QUERY_SLIMMING_USER_TEMPLATE.format(user_message=query)
+        user_message = QUERY_SLIMMING_USER_TEMPLATE.format(user_message=redact_pii_for_llm(query))
 
         # 4. 调用API
-        response = client.chat.completions.create(
+        response = openai.ChatCompletion.create(
             model=os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
             messages=[
                 {"role": "system", "content": QUERY_SLIMMING_SYSTEM},
@@ -102,7 +120,12 @@ def _rewrite_query_slimming(query: str) -> str:
             timeout=10
         )
 
-        slimming_q = response.choices[0].message.content.strip()
+        first_choice = response.choices[0]
+        message = getattr(first_choice, "message", None)
+        if isinstance(message, dict):
+            slimming_q = str(message.get("content") or "").strip()
+        else:
+            slimming_q = str(getattr(message, "content", "") or "").strip()
 
         # 5. 演示日志
         print("\n" + "—" * 40)
@@ -147,6 +170,329 @@ def _env_top_n_default() -> int:
     if not n:
         return 30
     return max(1, int(n))
+
+
+def _env_float(name: str, default: float = 0.0) -> float:
+    raw = env_str(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+
+def _env_rerank_min_score() -> float:
+    return max(0.0, _env_float("RAG_RERANK_MIN_SCORE", 0.0))
+
+
+def _env_vector_max_score() -> Optional[float]:
+    raw = env_str("RAG_VECTOR_MAX_SCORE", "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except Exception:
+        return None
+    return value if value >= 0 else None
+
+
+def _env_hybrid_enabled() -> bool:
+    return env_flag("RAG_HYBRID_ENABLED", default="1")
+
+
+def _env_hybrid_alpha() -> float:
+    value = _env_float("RAG_HYBRID_ALPHA", 0.60)
+    return min(1.0, max(0.0, value))
+
+
+def _env_hybrid_token_min_len() -> int:
+    value = env_int("RAG_HYBRID_TOKEN_MIN_LEN", default=2)
+    if not value:
+        return 2
+    return max(1, int(value))
+
+
+def _env_cache_enabled() -> bool:
+    return env_flag("RAG_CACHE_ENABLED", default="0")
+
+
+def _env_cache_ttl_seconds() -> int:
+    value = env_int("RAG_CACHE_TTL_SECONDS", default=300)
+    if not value:
+        return 300
+    return max(1, int(value))
+
+
+def _env_cache_max_entries() -> int:
+    value = env_int("RAG_CACHE_MAX_ENTRIES", default=128)
+    if not value:
+        return 128
+    return max(1, int(value))
+
+
+def _env_cache_sim_threshold() -> float:
+    value = _env_float("RAG_CACHE_SIM_THRESHOLD", 0.85)
+    return min(1.0, max(0.0, value))
+
+
+def clear_runtime_state() -> None:
+    """Reset module runtime caches for tests and local debugging."""
+
+    global _cached_embed, _cached_reranker, _cached_vs
+    global _retrieval_cache, _last_retrieval_meta
+
+    with _embed_lock:
+        _cached_embed = None
+    with _rerank_lock:
+        _cached_reranker = None
+    with _vs_lock:
+        _cached_vs = None
+    with _cache_lock:
+        _retrieval_cache = OrderedDict()
+    with _runtime_lock:
+        _last_retrieval_meta = {}
+
+
+def get_last_retrieval_meta() -> Dict[str, Any]:
+    with _runtime_lock:
+        return dict(_last_retrieval_meta)
+
+
+def _set_last_retrieval_meta(meta: Dict[str, Any]) -> None:
+    global _last_retrieval_meta
+    with _runtime_lock:
+        _last_retrieval_meta = dict(meta)
+
+
+def _normalize_query_for_cache(query: str) -> str:
+    return " ".join(str(query or "").strip().lower().split())
+
+
+def _tokenize_text(text: str) -> List[str]:
+    raw = re.findall(r"[A-Za-z0-9]+|[\u4e00-\u9fff]", str(text or ""))
+    if not raw:
+        return []
+
+    token_min_len = _env_hybrid_token_min_len()
+    tokens: List[str] = []
+    for token in raw:
+        if re.fullmatch(r"[\u4e00-\u9fff]", token):
+            tokens.append(token)
+            continue
+        t = token.lower()
+        if len(t) >= token_min_len:
+            tokens.append(t)
+    return tokens
+
+
+def _token_jaccard(a: Tuple[str, ...], b: Tuple[str, ...]) -> float:
+    sa = set(a)
+    sb = set(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / float(len(sa | sb))
+
+
+def _normalize_dense_relevance(items: List[Dict[str, Any]]) -> List[float]:
+    scores: List[float] = []
+    for item in items:
+        score = item.get("score")
+        if isinstance(score, (int, float)) and not isinstance(score, bool):
+            scores.append(float(score))
+        else:
+            scores.append(1.0)
+
+    if not scores:
+        return []
+
+    min_score = min(scores)
+    max_score = max(scores)
+    if math.isclose(max_score, min_score):
+        return [1.0 for _ in scores]
+
+    span = max_score - min_score
+    return [1.0 - ((score - min_score) / span) for score in scores]
+
+
+def _normalize_positive_scores(scores: List[float]) -> List[float]:
+    if not scores:
+        return []
+    max_score = max(scores)
+    min_score = min(scores)
+    if max_score <= 0:
+        return [0.0 for _ in scores]
+    if math.isclose(max_score, min_score):
+        return [1.0 for _ in scores]
+    span = max_score - min_score
+    return [(score - min_score) / span for score in scores]
+
+
+def _compute_sparse_scores(query: str, items: List[Dict[str, Any]]) -> List[float]:
+    query_tokens = _tokenize_text(query)
+    if not query_tokens or not items:
+        return [0.0 for _ in items]
+
+    docs_tokens = [_tokenize_text(str(item.get("text") or "")) for item in items]
+    if not any(docs_tokens):
+        return [0.0 for _ in items]
+
+    query_set = set(query_tokens)
+    doc_freq: Dict[str, int] = {}
+    for tokens in docs_tokens:
+        for token in set(tokens):
+            if token in query_set:
+                doc_freq[token] = doc_freq.get(token, 0) + 1
+
+    avgdl = sum(len(tokens) for tokens in docs_tokens) / max(len(docs_tokens), 1)
+    if avgdl <= 0:
+        avgdl = 1.0
+
+    k1 = 1.2
+    b = 0.75
+    n_docs = len(docs_tokens)
+    scores: List[float] = []
+    for tokens in docs_tokens:
+        tf: Dict[str, int] = {}
+        for token in tokens:
+            if token in query_set:
+                tf[token] = tf.get(token, 0) + 1
+
+        doc_len = max(len(tokens), 1)
+        score = 0.0
+        for token in query_set:
+            freq = tf.get(token, 0)
+            if freq <= 0:
+                continue
+            df = doc_freq.get(token, 0)
+            idf = math.log(1.0 + ((n_docs - df + 0.5) / (df + 0.5)))
+            denom = freq + k1 * (1.0 - b + b * (doc_len / avgdl))
+            score += idf * ((freq * (k1 + 1.0)) / denom)
+        scores.append(score)
+
+    return scores
+
+
+def _apply_hybrid_ranking(query: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not _env_hybrid_enabled() or len(items) <= 1:
+        return items
+
+    sparse_scores = _compute_sparse_scores(query, items)
+    if not any(score > 0 for score in sparse_scores):
+        return items
+
+    dense_scores = _normalize_dense_relevance(items)
+    sparse_relevance = _normalize_positive_scores(sparse_scores)
+    alpha = _env_hybrid_alpha()
+
+    ranked: List[Tuple[float, float, float, int, Dict[str, Any]]] = []
+    for idx, item in enumerate(items):
+        dense_value = dense_scores[idx] if idx < len(dense_scores) else 0.0
+        sparse_value = sparse_relevance[idx] if idx < len(sparse_relevance) else 0.0
+        hybrid_value = alpha * dense_value + (1.0 - alpha) * sparse_value
+        ranked.append((hybrid_value, sparse_value, -float(item.get("score") or 0.0), -idx, item))
+
+    ranked.sort(reverse=True)
+    return [item for _, _, _, _, item in ranked]
+
+
+def _build_cache_request_key(
+    *,
+    top_k: int,
+    top_n: int,
+    department: Optional[str],
+    use_rerank: bool,
+    hybrid_enabled: bool,
+) -> str:
+    dept = (department or "").strip().lower()
+    vector_max_score = _env_vector_max_score()
+    return "|".join(
+        [
+            "v2",
+            f"top_k={top_k}",
+            f"top_n={top_n}",
+            f"dept={dept}",
+            f"use_rerank={int(use_rerank)}",
+            f"hybrid={int(hybrid_enabled)}",
+            f"hybrid_alpha={_env_hybrid_alpha():.3f}",
+            f"rerank_min={_env_rerank_min_score():.3f}",
+            f"vector_max={'' if vector_max_score is None else f'{vector_max_score:.3f}'}",
+        ]
+    )
+
+
+def _build_cache_key(normalized_query: str, request_key: str) -> str:
+    return f"{request_key}|query={normalized_query}"
+
+
+def _prune_cache(now: float) -> None:
+    expired = [key for key, entry in _retrieval_cache.items() if entry.expires_at <= now]
+    for key in expired:
+        _retrieval_cache.pop(key, None)
+
+    max_entries = _env_cache_max_entries()
+    while len(_retrieval_cache) > max_entries:
+        _retrieval_cache.popitem(last=False)
+
+
+def _lookup_cache(
+    *,
+    normalized_query: str,
+    query_tokens: Tuple[str, ...],
+    request_key: str,
+) -> Tuple[Optional[List[Dict[str, Any]]], Dict[str, Any]]:
+    if not _env_cache_enabled():
+        return None, {"cache_hit": False, "cache_mode": None}
+
+    now = time.monotonic()
+    exact_key = _build_cache_key(normalized_query, request_key)
+
+    with _cache_lock:
+        _prune_cache(now)
+
+        exact_entry = _retrieval_cache.get(exact_key)
+        if exact_entry is not None:
+            _retrieval_cache.move_to_end(exact_key)
+            return deepcopy(exact_entry.items), {"cache_hit": True, "cache_mode": "exact", "cache_similarity": 1.0}
+
+        sim_threshold = _env_cache_sim_threshold()
+        for key in list(_retrieval_cache.keys())[::-1]:
+            entry = _retrieval_cache.get(key)
+            if entry is None or entry.request_key != request_key:
+                continue
+            sim = _token_jaccard(query_tokens, entry.query_tokens)
+            if sim >= sim_threshold:
+                _retrieval_cache.move_to_end(key)
+                return deepcopy(entry.items), {"cache_hit": True, "cache_mode": "semantic", "cache_similarity": round(sim, 4)}
+
+    return None, {"cache_hit": False, "cache_mode": None}
+
+
+def _store_cache(
+    *,
+    normalized_query: str,
+    query_tokens: Tuple[str, ...],
+    request_key: str,
+    items: List[Dict[str, Any]],
+) -> None:
+    if not _env_cache_enabled():
+        return
+
+    now = time.monotonic()
+    ttl_seconds = float(_env_cache_ttl_seconds())
+    entry = _CacheEntry(
+        cache_key=_build_cache_key(normalized_query, request_key),
+        request_key=request_key,
+        normalized_query=normalized_query,
+        query_tokens=query_tokens,
+        created_at=now,
+        expires_at=now + ttl_seconds,
+        items=deepcopy(items),
+    )
+    with _cache_lock:
+        _retrieval_cache[entry.cache_key] = entry
+        _retrieval_cache.move_to_end(entry.cache_key)
+        _prune_cache(now)
 
 
 def get_embedder() -> Tuple[Any, EmbeddingInfo]:
@@ -431,6 +777,31 @@ def _apply_rerank(query: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any
     return items
 
 
+def _apply_score_thresholds(items: List[Dict[str, Any]], *, use_rerank: bool) -> List[Dict[str, Any]]:
+    """Apply optional score thresholds before returning final evidence."""
+
+    vector_max_score = _env_vector_max_score()
+    rerank_min_score = _env_rerank_min_score()
+
+    filtered: List[Dict[str, Any]] = []
+    for item in items:
+        score = item.get("score")
+        if vector_max_score is not None:
+            if not isinstance(score, (int, float)) or isinstance(score, bool) or float(score) > vector_max_score:
+                continue
+
+        if use_rerank and rerank_min_score > 0:
+            rerank_score = item.get("rerank_score")
+            if not isinstance(rerank_score, (int, float)) or isinstance(rerank_score, bool):
+                continue
+            if float(rerank_score) < rerank_min_score:
+                continue
+
+        filtered.append(item)
+
+    return filtered
+
+
 def retrieve(
     query: str,
     top_k: int = 5,
@@ -446,7 +817,29 @@ def retrieve(
     """
     q = (query or "").strip()
     if not q:
+        _set_last_retrieval_meta({"query": "", "cache_hit": False, "cache_mode": None, "hybrid_enabled": _env_hybrid_enabled()})
         return []
+
+    try:
+        vs = get_vectordb()
+        if int(vs._collection.count()) <= 0:  # type: ignore[attr-defined]
+            _set_last_retrieval_meta(
+                {
+                    "query": q,
+                    "search_query": q,
+                    "top_k": int(top_k) if top_k and int(top_k) > 0 else 5,
+                    "top_n": int(top_n) if top_n is not None else _env_top_n_default(),
+                    "department": (department or "").strip(),
+                    "use_rerank": _env_use_reranker() if use_rerank is None else bool(use_rerank),
+                    "hybrid_enabled": _env_hybrid_enabled(),
+                    "cache_hit": False,
+                    "cache_mode": None,
+                    "hits": 0,
+                }
+            )
+            return []
+    except Exception:
+        pass
 
     # === [M1 检索优化：触发瘦身逻辑] ===
     # 策略：长度超过 15 个字才瘦身，短句直接检索
@@ -459,6 +852,39 @@ def retrieve(
     n = int(top_n) if top_n is not None else _env_top_n_default()
     if n < k:
         n = k
+    do_rerank = _env_use_reranker() if use_rerank is None else bool(use_rerank)
+    hybrid_enabled = _env_hybrid_enabled()
+    normalized_query = _normalize_query_for_cache(search_q)
+    query_tokens = tuple(_tokenize_text(search_q))
+    request_key = _build_cache_request_key(
+        top_k=k,
+        top_n=n,
+        department=department,
+        use_rerank=do_rerank,
+        hybrid_enabled=hybrid_enabled,
+    )
+
+    base_meta: Dict[str, Any] = {
+        "query": q,
+        "search_query": search_q,
+        "top_k": k,
+        "top_n": n,
+        "department": (department or "").strip(),
+        "use_rerank": do_rerank,
+        "hybrid_enabled": hybrid_enabled,
+    }
+
+    cached_items, cache_meta = _lookup_cache(
+        normalized_query=normalized_query,
+        query_tokens=query_tokens,
+        request_key=request_key,
+    )
+    if cached_items is not None:
+        hit_meta = dict(base_meta)
+        hit_meta.update(cache_meta)
+        hit_meta["hits"] = len(cached_items)
+        _set_last_retrieval_meta(hit_meta)
+        return cached_items
 
     # 使用 search_q 进行向量召回
     docs_scores = _vector_search(search_q, top_n=n, department=department)
@@ -471,17 +897,27 @@ def retrieve(
             continue
         items.append(it)
 
-    # 是否启用 rerank：入参优先，其次环境变量
-    do_rerank = _env_use_reranker() if use_rerank is None else bool(use_rerank)
+    items = _apply_hybrid_ranking(search_q, items)
     if do_rerank and items:
         # 重排建议使用原句 q，因为精排模型需要上下文
         items = _apply_rerank(q, items)
+
+    items = _apply_score_thresholds(items, use_rerank=do_rerank)
 
     # 截断 top_k，并重建 eid 连续
     items = items[:k]
     for i, it in enumerate(items, start=1):
         it["eid"] = f"E{i}"
 
+    _store_cache(
+        normalized_query=normalized_query,
+        query_tokens=query_tokens,
+        request_key=request_key,
+        items=items,
+    )
+    miss_meta = dict(base_meta)
+    miss_meta.update({"cache_hit": False, "cache_mode": None, "hits": len(items)})
+    _set_last_retrieval_meta(miss_meta)
     return items
 
 

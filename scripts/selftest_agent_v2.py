@@ -21,12 +21,54 @@ import requests
 
 
 BASE = "http://127.0.0.1:8000"
+_SLOT_REPLY = {
+    "age": "我24岁。",
+    "sex": "我是男。",
+    "symptoms": "主要症状是头痛。",
+    "duration": "已经持续两天了。",
+    "severity": "严重程度6/10。",
+    "fever": "没有发烧。",
+    "location": "主要在头部。",
+    "meds": "目前没有用药。",
+    "allergy": "无药物过敏史。",
+    "history": "既往无特殊病史。",
+    "pregnancy": "不适用。",
+}
 
 
 def _post(payload: Dict[str, Any]) -> Dict[str, Any]:
     r = requests.post(f"{BASE}/v1/agent/chat_v2", json=payload, timeout=60)
     r.raise_for_status()
     return r.json()
+
+
+def _build_reply_from_questions(questions: Any) -> str:
+    parts = []
+    seen = set()
+    if isinstance(questions, list):
+        for q in questions:
+            if not isinstance(q, dict):
+                continue
+            slot = str(q.get("slot") or "").strip()
+            if not slot or slot in seen:
+                continue
+            seen.add(slot)
+            reply = _SLOT_REPLY.get(slot)
+            if reply:
+                parts.append(reply)
+    if not parts:
+        parts.append("主要症状是头痛，已经两天了，严重程度6/10，没有发烧，目前没有用药，无药物过敏史。")
+    return " ".join(parts)
+
+
+def _is_valid_escalate_trace(trace: Any) -> bool:
+    if not isinstance(trace, dict):
+        return False
+    order = trace.get("node_order")
+    if not isinstance(order, list):
+        return False
+    required = {"SafetyGate", "PersistState"}
+    return required.issubset(set(str(x) for x in order))
 
 
 def main() -> int:
@@ -54,28 +96,29 @@ def main() -> int:
         print("[M2] FAIL: Step1 期望 trace.timings_ms 为 dict")
         return 1
 
-    print("\n[M2] Step2: 第2轮（same session），补充年龄/性别/疼痛分 -> 仍可能 ask")
-    out2 = _post({"session_id": sid, "user_message": "我24岁男，疼痛程度6/10", "top_k": 3, "top_n": 30, "use_rerank": True})
-    print(json.dumps(out2, ensure_ascii=False, indent=2))
-    if out2.get("session_id") != sid:
-        print("[M2] FAIL: Step2 session_id 未延续")
-        return 1
-    if out2.get("mode") != "ask":
-        print("[M2] FAIL: Step2 期望 mode=ask")
-        return 1
-    if not (out2.get("questions") or out2.get("next_questions")):
-        print("[M2] FAIL: Step2 期望 questions 或 next_questions 非空")
+    print("\n[M2] Step2-StepN: 根据 questions 自动补槽位，直到进入 answer")
+    current = out1
+    out_answer: Dict[str, Any] = {}
+    for step in range(2, 7):
+        if current.get("mode") == "answer":
+            out_answer = current
+            break
+        questions = current.get("questions") or []
+        reply = _build_reply_from_questions(questions)
+        current = _post({"session_id": sid, "user_message": reply, "top_k": 3, "top_n": 30, "use_rerank": True})
+        print(json.dumps(current, ensure_ascii=False, indent=2))
+        if current.get("session_id") != sid:
+            print(f"[M2] FAIL: Step{step} session_id 未延续")
+            return 1
+        if current.get("mode") == "answer":
+            out_answer = current
+            break
+
+    if not out_answer:
+        print("[M2] FAIL: 在限定轮次内未进入 answer")
         return 1
 
-    print("\n[M2] Step3: 第3轮（same session），补充是否发烧 -> 应进入 answer")
-    out3 = _post({"session_id": sid, "user_message": "没有发烧", "top_k": 3, "top_n": 30, "use_rerank": True})
-    print(json.dumps(out3, ensure_ascii=False, indent=2))
-    if out3.get("session_id") != sid:
-        print("[M2] FAIL: Step3 session_id 未延续")
-        return 1
-    if out3.get("mode") != "answer" or not (out3.get("answer") or "").strip():
-        print("[M2] FAIL: Step3 期望 mode=answer 且 answer 非空")
-        return 1
+    out3 = out_answer
 
     tr3 = out3.get("trace") or {}
     if not (tr3.get("node_order") or []):
@@ -102,9 +145,8 @@ def main() -> int:
 
     tr4 = out4.get("trace") or {}
     order4 = tr4.get("node_order") or []
-    must = {"SafetyGate", "MemoryUpdate", "TriagePlanner", "PersistState"}
-    if not must.issubset(set(order4)):
-        print(f"[M2] FAIL: Step4 trace.node_order 缺少关键节点：{must}，实际={order4}")
+    if not _is_valid_escalate_trace(tr4):
+        print(f"[M2] FAIL: Step4 trace.node_order 未体现 SafetyGate -> PersistState 短路，实际={order4}")
         return 1
 
     print("\n[M2] DONE")

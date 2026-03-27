@@ -97,6 +97,7 @@ class AgentSessionState(BaseModel):
     messages: List[Message] = Field(default_factory=list, description="最近 N 轮对话")
     slots: Slots = Field(default_factory=Slots)
     summary: str = Field(default="", description="短摘要，用于构建 rag_query 与 LLM 上下文")
+    record_summary: str = Field(default="", description="纵向档案摘要，优先保留年龄/过敏史/既往史/用药等稳定信息")
 
     # 为动态追问与防重复服务：
     # - asked_slots：历史已追问过的槽位集合（只存字段名）

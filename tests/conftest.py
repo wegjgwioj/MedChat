@@ -43,3 +43,49 @@ def monkeypatch_session():
     yield mp
     mp.undo()
 
+
+class _FakeRedisClient:
+    def __init__(self):
+        self._data = {}
+
+    def ping(self):
+        return True
+
+    def get(self, key):
+        return self._data.get(key)
+
+    def set(self, key, value):
+        self._data[key] = value
+        return True
+
+    def delete(self, key):
+        self._data.pop(key, None)
+        return 1
+
+
+@pytest.fixture(autouse=True)
+def fake_agent_session_redis(monkeypatch):
+    monkeypatch.setenv("AGENT_REDIS_URL", "redis://pytest-session-store/0")
+
+    try:
+        from app.agent.storage_redis import RedisSessionStore
+    except Exception:
+        yield
+        return
+
+    monkeypatch.setattr(
+        RedisSessionStore,
+        "_create_client",
+        staticmethod(lambda _redis_url: _FakeRedisClient()),
+    )
+
+    try:
+        import app.agent.graph as graph
+
+        monkeypatch.setattr(graph, "_STORE", None, raising=False)
+        monkeypatch.setattr(graph, "_GRAPH", None, raising=False)
+    except Exception:
+        pass
+
+    yield
+

@@ -4,11 +4,26 @@
 
 ## 产物列表
 
+- `eval_suite_summary.json`：统一评测入口汇总（串联 C1/C2/C3）
 - `meddg_eval_summary.json`：C1 端到端多轮回放汇总
 - `meddg_eval_cases.csv`：C1 case 级明细（每段对话/每轮）
 - `rag_eval_summary.json`：C2 RAG 离线质量汇总
 - `rag_eval_details.csv`：C2 query 级明细
 - `perf_eval.json`：C3 性能评测汇总
+
+## 推荐入口
+
+优先使用统一入口，一次生成整套 summary：
+
+```powershell
+python scripts/eval_run_all.py --meddg_path app/MedDG_UTF8/test.pk --base_url http://127.0.0.1:8000 --out_dir reports
+```
+
+如需跳过某一类评测：
+
+```powershell
+python scripts/eval_run_all.py --meddg_path app/MedDG_UTF8/test.pk --base_url http://127.0.0.1:8000 --skip_perf
+```
 
 ## 复现命令（Windows PowerShell）
 
@@ -25,6 +40,7 @@ uvicorn app.api_server:app --host 127.0.0.1 --port 8000
 然后执行：
 
 ```powershell
+python scripts/eval_run_all.py --meddg_path app/MedDG_UTF8/test.pk --base_url http://127.0.0.1:8000 --out_dir reports
 python scripts/eval_meddg_e2e.py --meddg_path app/MedDG_UTF8/test.pk --n 100 --base_url http://127.0.0.1:8000 --top_k 5 --top_n 30 --use_rerank 1
 python scripts/eval_rag_quality.py --meddg_path app/MedDG_UTF8/test.pk --n 200 --top_k 5 --top_n 30 --use_rerank 1 --base_url http://127.0.0.1:8000
 python scripts/eval_perf.py --base_url http://127.0.0.1:8000 --concurrency 1,5,10 --requests 20 --meddg_path app/MedDG_UTF8/test.pk

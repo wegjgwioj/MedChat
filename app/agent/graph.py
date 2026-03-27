@@ -1005,6 +1005,7 @@ def _node_rag_retrieve(state: AgentGraphState) -> Dict[str, Any]:
     # 调用 M1：必须走兼容层 app.rag.retriever.retrieve
     evidence: List[Dict[str, Any]]
     try:
+        from app.rag.retriever import get_last_retrieval_meta as rag_get_last_retrieval_meta  # type: ignore
         from app.rag.retriever import retrieve as rag_retrieve  # type: ignore
         from app.rag.rag_core import get_stats  # type: ignore
 
@@ -1020,6 +1021,7 @@ def _node_rag_retrieve(state: AgentGraphState) -> Dict[str, Any]:
             ),
         )
         rag_latency_ms = int((_now_ms() - rag_t0) * 1000)
+        rag_meta = rag_get_last_retrieval_meta()
 
         st = get_stats()
         tr_any = state.get("trace")
@@ -1032,6 +1034,10 @@ def _node_rag_retrieve(state: AgentGraphState) -> Dict[str, Any]:
             "latency_ms": rag_latency_ms,
             "evidence_quality": summarize_evidence_quality(evidence),
         }
+        if isinstance(rag_meta, dict):
+            for key in ("cache_hit", "cache_mode", "hybrid_enabled", "search_query"):
+                if key in rag_meta:
+                    tr["rag_stats"][key] = rag_meta.get(key)
         state["trace"] = cast(Dict[str, Any], tr)
 
     except Exception as e:

@@ -1181,7 +1181,7 @@ def rag_retrieve(
         return auth_resp  # type: ignore[return-value]
 
     from app.rag.evidence_policy import summarize_evidence_quality
-    from app.rag.rag_core import get_stats, retrieve
+    from app.rag.rag_core import get_last_retrieval_meta, get_stats, retrieve
 
     q = (req.query or "").strip()
     logger.info("RAG_RETRIEVE trace_id=%s query=%s top_k=%s top_n=%s dept=%s", trace_id, _safe_query_for_log(q), req.top_k, req.top_n, (req.department or ""))
@@ -1193,6 +1193,7 @@ def rag_retrieve(
         department=req.department,
         use_rerank=req.use_rerank,
     )
+    retrieval_meta = get_last_retrieval_meta()
     st = get_stats()
 
     effective_use_rerank = req.use_rerank if req.use_rerank is not None else _env_flag("RAG_USE_RERANKER", "1")
@@ -1204,6 +1205,7 @@ def rag_retrieve(
         "use_rerank": bool(effective_use_rerank),
         "evidence": evidence,
         "evidence_quality": summarize_evidence_quality(evidence),
+        "retrieval_meta": retrieval_meta,
         "stats": {
             "collection": st.collection,
             "count": st.count,

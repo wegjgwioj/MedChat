@@ -577,8 +577,15 @@ class TriageEngine:
             t0 = time.perf_counter()
             try:
                 evidence_list = rag_retriever.retrieve(rag_query, top_k=top_k)
+                rag_meta_getter = getattr(rag_retriever, "get_last_retrieval_meta", None)
+                rag_meta = rag_meta_getter() if callable(rag_meta_getter) else {}
                 rag_status = "ok"
-                self._trace_step(trace, "rag.retrieve", "ok", t0, top_k=top_k, n_evidence=len(evidence_list))
+                trace_info: Dict[str, Any] = {"top_k": top_k, "n_evidence": len(evidence_list)}
+                if isinstance(rag_meta, dict):
+                    for key in ("cache_hit", "cache_mode", "hybrid_enabled", "search_query"):
+                        if key in rag_meta:
+                            trace_info[key] = rag_meta.get(key)
+                self._trace_step(trace, "rag.retrieve", "ok", t0, **trace_info)
                 quality = summarize_evidence_quality(evidence_list)
                 trace.append(
                     {

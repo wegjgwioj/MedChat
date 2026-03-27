@@ -16,6 +16,8 @@
 - 分诊：检索证据、生成结构化结果（风险等级/红旗症状/就医建议等）
 - 纵向档案摘要：从年龄/既往史/用药/过敏史中生成 `record_summary`，用于后续检索与安全约束
 - 记录感知安全护栏：当回答命中既往过敏药物时自动追加警示，并在 triage JSON 中移除高风险动作
+- 混合检索：在 dense 候选上叠加本地 sparse BM25 风格评分，提升短症状词/短问句的召回稳定性
+- 语义缓存：重复或高度相似的 query 可直接命中进程内缓存，降低重复检索延迟
 - OCR 入库：支持远程 URL 解析和本地文件上传，完成后自动入库到向量库
 - 引用强制：回答中的 `[E1]` 等引用必须能定位到证据块
 - 安全审查：`mode=safe` 会启用更严格的安全审查链
@@ -146,6 +148,12 @@ npm run dev
 - `ALLOW_SAVE_SESSION_RAW_TEXT=1`：可选，落盘保存原文（不推荐，注意隐私）
 - `CHAT_SLOT_EXTRACTOR=rules`：可选，强制不用 LLM 抽槽（用于离线测试/稳定性）
 - `AGENT_SLOT_EXTRACTOR=rules`：可选，强制 `/v1/agent/chat_v2` 不用 LLM 抽槽（用于离线测试/CI）
+- `RAG_HYBRID_ENABLED=1`：可选，开启 dense+sparse 混合排序
+- `RAG_HYBRID_ALPHA=0.60`：可选，控制 hybrid 中 dense 权重
+- `RAG_CACHE_ENABLED=0|1`：可选，开启进程内语义缓存
+- `RAG_CACHE_TTL_SECONDS=300`：可选，缓存 TTL
+- `RAG_CACHE_MAX_ENTRIES=128`：可选，缓存最大条目数
+- `RAG_CACHE_SIM_THRESHOLD=0.85`：可选，语义缓存相似度阈值
 - `clinical_record_path`：`/v1/triage` 可选字段；传入本地病历/摘要文本路径后，会启用基于过敏史的记录感知安全护栏
 
 Windows 兼容性：

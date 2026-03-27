@@ -35,6 +35,16 @@ def test_rag_retrieve_api_includes_evidence_quality(monkeypatch):
         ],
     )
     monkeypatch.setattr(rag_core, "get_stats", lambda: FakeStats())
+    monkeypatch.setattr(
+        rag_core,
+        "get_last_retrieval_meta",
+        lambda: {
+            "search_query": "咳嗽怎么办",
+            "cache_hit": True,
+            "cache_mode": "semantic",
+            "hybrid_enabled": True,
+        },
+    )
 
     client = TestClient(app)
     resp = client.post("/v1/rag/retrieve", json={"query": "咳嗽怎么办", "top_k": 5, "top_n": 30, "use_rerank": True})
@@ -44,6 +54,10 @@ def test_rag_retrieve_api_includes_evidence_quality(monkeypatch):
     assert body["evidence_quality"]["level"] == "low"
     assert body["evidence_quality"]["reason"] == "too_few_hits"
     assert body["evidence_quality"]["count"] == 1
+    assert body["retrieval_meta"]["cache_hit"] is True
+    assert body["retrieval_meta"]["cache_mode"] == "semantic"
+    assert body["retrieval_meta"]["hybrid_enabled"] is True
+    assert body["retrieval_meta"]["search_query"] == "咳嗽怎么办"
 
 
 def test_eval_meddg_summary_includes_evidence_quality_counts():

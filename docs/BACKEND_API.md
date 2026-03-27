@@ -104,6 +104,7 @@ Schema（来自 Pydantic 模型 `AgentChatV2Response`）：
 补充说明：
 
 - `trace.record_conflicts`：若回答命中过敏史冲突，会返回命中的 `matched_term/record_term/message` 列表；无冲突时为空列表或缺省。
+- `trace.rag_stats`：当前会补充 `cache_hit/cache_mode/hybrid_enabled/search_query/evidence_quality`，便于观察检索是否命中缓存以及是否开启 hybrid。
 
 字段契约（何时为空）：
 
@@ -197,6 +198,12 @@ curl -sS "http://127.0.0.1:8000/v1/rag/stats"
 
 - `RAG_RERANK_MIN_SCORE`：number，可选；启用 rerank 时，仅保留 `rerank_score >= 阈值` 的证据
 - `RAG_VECTOR_MAX_SCORE`：number，可选；无论是否启用 rerank，都先过滤 `score > 阈值` 的证据
+- `RAG_HYBRID_ENABLED`：bool，可选；默认开启，对 dense 候选执行 sparse+dense 混合排序
+- `RAG_HYBRID_ALPHA`：number，可选；hybrid 中 dense 权重，范围 `[0,1]`
+- `RAG_CACHE_ENABLED`：bool，可选；开启进程内语义缓存
+- `RAG_CACHE_TTL_SECONDS`：int，可选；缓存 TTL
+- `RAG_CACHE_MAX_ENTRIES`：int，可选；缓存最大条目数
+- `RAG_CACHE_SIM_THRESHOLD`：number，可选；近似 query 复用缓存的相似度阈值
 
 Windows PowerShell（带鉴权示例）：
 
@@ -225,6 +232,7 @@ curl -sS "http://127.0.0.1:8000/v1/rag/retrieve" \
 - `use_rerank`：bool（若请求未显式传，则由环境变量推导）
 - `evidence`：array[object]，证据列表
 - `evidence_quality`：object（`level/reason/count/...`，与后端统一证据质量口径一致）
+- `retrieval_meta`：object，最近一次检索的轻量元信息；当前可能包含 `search_query/cache_hit/cache_mode/hybrid_enabled`
 - `stats`：object（collection/count/device/embed_model/rerank_model）
 
 `evidence` 单条字段契约（由单测保障）：
@@ -266,6 +274,7 @@ curl -sS "http://127.0.0.1:8000/v1/rag/retrieve" \
 - `answer.record_conflicts`：array[object]，仅在命中记录安全冲突时出现
 - `answer.uncertainty`：会追加 `record_conflict`
 - `meta.trace`：会追加 `record.safety`
+- `meta.trace` 中的 `rag.retrieve` 步骤会追加 `cache_hit/cache_mode/hybrid_enabled/search_query`
 
 示例（精简）：
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from app.rag.rag_core import get_last_retrieval_meta as _get_last_retrieval_meta
 from app.rag.rag_core import retrieve as _retrieve_core
 
 
@@ -36,3 +37,7 @@ def retrieve(
         department=department,
         use_rerank=use_rerank,
     )
+
+
+def get_last_retrieval_meta() -> Dict[str, Any]:
+    return _get_last_retrieval_meta()

@@ -4,10 +4,15 @@
 from __future__ import annotations
 
 import os
+import logging
+from pathlib import Path
 from typing import Any, Dict, Optional, Protocol
 
 from app.agent.state import AgentSessionState
+from app.agent.storage_sqlite import SqliteSessionStore
 from app.agent.storage_redis import RedisSessionStore
+
+logger = logging.getLogger(__name__)
 
 
 class SessionStore(Protocol):
@@ -32,5 +37,20 @@ def _build_redis_session_store() -> RedisSessionStore:
     return RedisSessionStore(redis_url=redis_url, key_prefix=key_prefix)
 
 
+def _build_sqlite_session_store() -> SqliteSessionStore:
+    db_path = (os.getenv("AGENT_SQLITE_DB_PATH") or "").strip()
+    return SqliteSessionStore(Path(db_path) if db_path else None)
+
+
 def build_session_store() -> SessionStore:
-    return _build_redis_session_store()
+    preferred = (os.getenv("AGENT_SESSION_STORE") or "").strip().lower()
+    if preferred == "sqlite":
+        return _build_sqlite_session_store()
+    if preferred == "redis":
+        return _build_redis_session_store()
+
+    try:
+        return _build_redis_session_store()
+    except Exception as e:
+        logger.warning("Redis session store unavailable, falling back to SQLite: %s", e)
+        return _build_sqlite_session_store()

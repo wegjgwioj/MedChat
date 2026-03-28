@@ -1,6 +1,6 @@
 # MedCaht 后端评测闭环（模板 + 复现方法）
 
-版本：2025-12-23
+版本：2026-03-28
 
 约束：
 
@@ -75,6 +75,7 @@
   - `RAG_PERSIST_DIR`（默认在 app/rag/kb_store）
   - `RAG_DEVICE`/`RAG_EMBEDDING_DEVICE`（cpu/cuda）
   - `RAG_USE_RERANKER`（true/false）
+  - `AGENT_REDIS_URL` / `RAG_REDIS_URL`（开启会话存储与 Redis 语义缓存时必需）
   - 见 [app/rag/utils/rag_shared.py](../app/rag/utils/rag_shared.py)
 
 ### 3.2 启动服务
@@ -174,6 +175,8 @@ python scripts/eval_meddg_e2e.py --base_url http://127.0.0.1:8000 --split test -
 - Trace 完整性（建议抽样检查）：
   - `trace.node_order` 为空比例：
   - `trace.timings_ms` 是否含关键节点：SafetyGate/Planner/RAG/Compose/Persist
+  - `trace.phase0_guardrail` 是否按预期记录 blocked/label
+  - `trace.record_admission` 是否记录 admitted/merged/dropped
 
 证据字段定义：见 [app/agent/graph.py](../app/agent/graph.py) 的 `_trace_start/_trace_end`。
 
@@ -218,6 +221,8 @@ python scripts/eval_rag_quality.py --base_url http://127.0.0.1:8000 --split test
   - rerank 启用/禁用对比（两次运行对照）：
   - 阈值过滤对比（建议至少对照一组 `RAG_RERANK_MIN_SCORE` / `RAG_VECTOR_MAX_SCORE`）：
   - 低证据比例（返回 evidence 条数 < `RAG_MIN_EVIDENCE`）：
+  - `dense_hits/sparse_hits` 分布（验证双路召回是否工作）：
+  - `cache_hit/cache_mode/cache_backend` 分布（验证 Redis 语义缓存是否工作）：
 
 - 契约一致性：
   - evidence item 必填字段缺失次数（eid/text/source/chunk_id）：

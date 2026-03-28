@@ -1,6 +1,6 @@
 # MedCaht 后端项目总报告（LLM + RAG + LangGraph Agent + 评测闭环）
 
-版本：2025-12-23
+版本：2026-03-28
 
 本报告仅覆盖后端（FastAPI / RAG / LangGraph Agent / 评测脚本与产物），不包含前端。
 
@@ -10,9 +10,9 @@
 
 目标：构建一个面向中文医患对话场景的“风险分层 + 证据检索 + 可追问编排”的后端服务。
 
-- LLM：通过 LangChain 的 OpenAI 兼容接口对接（默认 DeepSeek 兼容端点），用于回答生成与槽位抽取（可降级）。见 [app/config_llm.py](../app/config_llm.py)。
-- RAG：使用 Chroma 本地持久化向量库，默认优先使用 BCEmbedding 的 BCE embedding；可选 BCE reranker 两阶段重排。见 [app/rag/rag_core.py](../app/rag/rag_core.py) 与 [app/rag/utils/rag_shared.py](../app/rag/utils/rag_shared.py)。
-- LangGraph Agent：提供多轮“Ask / Answer / Escalate”状态机、结构化追问、session 持久化与 trace。见 [app/agent/graph.py](../app/agent/graph.py)。
+- LLM：通过 LangChain 的 OpenAI 兼容接口对接（默认 DeepSeek 兼容端点），用于回答生成与槽位抽取。见 [app/config_llm.py](../app/config_llm.py)。
+- RAG：使用 Faiss-HNSW 本地持久化索引，默认优先使用 BCEmbedding 的 BCE embedding；支持 dense+sparse 双路召回、可选 BCE reranker 和 Redis 语义缓存。见 [app/rag/rag_core.py](../app/rag/rag_core.py)、[app/rag/faiss_store.py](../app/rag/faiss_store.py) 与 [app/rag/cache_redis.py](../app/rag/cache_redis.py)。
+- LangGraph Agent：提供带 Phase 0 护栏、纵向档案准入、记录冲突校验的多轮“Ask / Answer / Escalate”状态机，并通过 Redis 持久化会话与 trace。见 [app/agent/graph.py](../app/agent/graph.py)。
 - 评测闭环：提供端到端多轮回放、RAG 离线质量评估、轻量并发压测脚本与 reports 产物说明。见 [scripts/](../scripts/) 与 [reports/README.md](../reports/README.md)。
 
 ---
@@ -56,17 +56,18 @@ flowchart LR
   subgraph M2[LangGraph Agent (M2)]
     G[app/agent/graph.py\nStateGraph: Safety->Memory->Plan->RAG->Compose->Persist]
     S[app/agent/state.py\nSlots + Summary]
-    ST[app/agent/storage_sqlite.py\nSQLite sessions]
+    ST[app/agent/storage.py + storage_redis.py\nRedis sessions]
   end
 
   subgraph M1[RAG Service (M1)]
-    RC[app/rag/rag_core.py\nChroma + Embedding + optional rerank]
+    RC[app/rag/rag_core.py\nFaiss-HNSW + hybrid retrieve + rerank + Redis cache]
+    FS[app/rag/faiss_store.py\nFaissHNSWStore]
     RS[app/rag/utils/rag_shared.py\nembedding/device/config]
-    KB[(app/rag/kb_store/\nChroma persist)]
+    KB[(app/rag/kb_store/\nindex.faiss + docs.jsonl + meta.json)]
   end
 
   subgraph M0[Ingest (M0)]
-    IN[app/rag/ingest_kb.py\nKB CSV -> chunk -> Chroma]
+    IN[app/rag/ingest_kb.py\nKB CSV -> chunk -> Faiss-HNSW]
     KBD[(app/rag/kb_docs/\nCSV knowledge base)]
   end
 
@@ -81,10 +82,11 @@ flowchart LR
   G --> S
   G --> ST
   G --> RC
+  RC --> FS
   RC --> RS
-  RC --> KB
+  FS --> KB
   IN --> RS
-  IN --> KB
+  IN --> FS
   IN --> KBD
   E1 --> A
   E2 --> A
@@ -103,25 +105,25 @@ sequenceDiagram
   participant C as Client
   participant API as FastAPI (/v1/agent/chat_v2)
   participant LG as LangGraph (app/agent/graph.py)
-  participant DB as SQLite (app/data/agent_sessions.sqlite3)
+  participant DB as Redis Session Store
   participant RAG as RAG Core (app/rag/rag_core.py)
   participant LLM as LLM (DeepSeek via LangChain)
 
   C->>API: POST /v1/agent/chat_v2 {session_id?, user_message, top_k, top_n, use_rerank}
   API->>LG: run_chat_v2_turn(...)
   LG->>DB: load_session(session_id)
-  LG->>LG: SafetyGate
-  alt red_flag_hits
+  LG->>LG: SafetyGate (Phase 0 guardrail + red flag)
+  alt phase0_blocked or red_flag_hits
     LG->>LG: mode=escalate + answer=ESCALATE_ANSWER_TEMPLATE
   else no red flags
-    LG->>LG: MemoryUpdate (slot extractor: LLM or rules)
+    LG->>LG: MemoryUpdate (slot update + longitudinal record admission)
     LG->>LG: TriagePlanner (mode=ask or answer)
     alt mode=answer
       LG->>RAG: retrieve(rag_query, top_k, top_n, department, use_rerank)
       alt evidence>0
         LG->>LLM: compose answer with evidence block
       else evidence=0
-        LG->>LG: deterministic fallback answer
+        LG->>LG: low-evidence answer template
       end
     else mode=ask
       LG->>LG: build structured follow-up questions
@@ -139,7 +141,7 @@ sequenceDiagram
 
 关键实现：
 
-- 入库脚本：将 [app/rag/kb_docs/](../app/rag/kb_docs/) 下 CSV 读取、清洗、切分并写入 Chroma 持久化目录 [app/rag/kb_store/](../app/rag/kb_store/)。见 [app/rag/ingest_kb.py](../app/rag/ingest_kb.py)。
+- 入库脚本：将 [app/rag/kb_docs/](../app/rag/kb_docs/) 下 CSV 读取、清洗、切分并写入 Faiss-HNSW 持久化目录 [app/rag/kb_store/](../app/rag/kb_store/)。见 [app/rag/ingest_kb.py](../app/rag/ingest_kb.py)。
 - 统一 embedding/device：入库与检索共用 `make_embeddings()` 与 `resolve_embedding_device()`，确保一致性并支持 GPU 优先。见 [app/rag/utils/rag_shared.py](../app/rag/utils/rag_shared.py)。
 - Windows OpenMP 兼容：入库与检索都调用 `apply_windows_openmp_workaround()` 进行兼容处理。见 [app/rag/utils/rag_shared.py](../app/rag/utils/rag_shared.py)。
 
@@ -148,16 +150,17 @@ sequenceDiagram
 - 在运行入库前固定环境变量（embedding provider、device、模型名）以保证可复现。
 - 对 CSV 的编码与非法行做拒绝记录，避免 “silent bad data”。见 [app/rag/ingest_kb.py](../app/rag/ingest_kb.py) 的 `_append_bad_row`。
 
-### 4.2 M1 RAGService（Chroma + BCEEmbedding + 可选 BCE rerank）
+### 4.2 M1 RAGService（Faiss-HNSW + dual-path hybrid + Redis cache）
 
 在线接口：
 
-- `/v1/rag/stats`：返回 `collection/count/persist_dir/device/embed_model/rerank_model/updated_at`。见 [app/api_server.py](../app/api_server.py) 的 `rag_stats()`。
+- `/v1/rag/stats`：返回 `backend/collection/count/persist_dir/device/embed_model/rerank_model/updated_at`。见 [app/api_server.py](../app/api_server.py) 的 `rag_stats()`。
 - `/v1/rag/retrieve`：返回 `evidence` 列表与 `stats`。见 [app/api_server.py](../app/api_server.py) 的 `rag_retrieve()`。
 
 核心实现：
 
-- `retrieve(query, top_k, top_n, department, use_rerank)`：两阶段检索（top_n 向量召回 + 可选 rerank），返回固定 evidence 契约。见 [app/rag/rag_core.py](../app/rag/rag_core.py) 的 `retrieve()`。
+- `retrieve(query, top_k, top_n, department, use_rerank)`：先执行 Faiss-HNSW dense 检索，再执行本地 sparse 检索，合并候选后按 hybrid 分数排序，并可继续 rerank / score threshold 过滤；返回固定 evidence 契约。见 [app/rag/rag_core.py](../app/rag/rag_core.py) 的 `retrieve()`。
+- `get_last_retrieval_meta()`：暴露 `cache_hit/cache_mode/cache_backend/hybrid_enabled/dense_hits/sparse_hits/search_query` 等检索元信息，供 API / Agent trace 复用。
 - evidence 字段契约由单测保障。见 [tests/test_rag_retrieve_contract.py](../tests/test_rag_retrieve_contract.py)。
 
 ### 4.3 M2 LangGraphAgent（/v1/agent/chat_v2：Ask/Answer/Escalate）
@@ -168,13 +171,13 @@ sequenceDiagram
 
 核心状态机：
 
-- 节点：`SafetyGate`（红旗分流）、`MemoryUpdate`（槽位抽取与摘要）、`TriagePlanner`（Ask/Answer 决策）、`RAGRetrieve`（调用 M1）、`AnswerCompose`（LLM 或模板）、`PersistState`（SQLite 落库）。见 [app/agent/graph.py](../app/agent/graph.py)。
+- 节点：`SafetyGate`（Phase 0 护栏 + 红旗分流）、`MemoryUpdate`（槽位抽取、摘要与 longitudinal record admission）、`TriagePlanner`（Ask/Answer 决策）、`RAGRetrieve`（调用 M1）、`AnswerCompose`（LLM 或模板）、`PersistState`（Redis 落库）。见 [app/agent/graph.py](../app/agent/graph.py)。
 - Ask/Answer/Escalate 条件：
   - Escalate：`SafetyGate` 命中红旗关键词，直接返回。见 `_node_safety_gate()`。
   - Ask：槽位不足则构造结构化追问。见 `_node_triage_planner()`。
   - Answer：槽位满足或知识问答直达，进入检索与回答。见 `_node_triage_planner()` 与 `_node_rag_retrieve()`。
-- Session 持久化：SQLite 表 `sessions(session_id PRIMARY KEY, state_json, updated_at)`，默认路径为 [app/data/agent_sessions.sqlite3](../app/data/agent_sessions.sqlite3)。见 [app/agent/storage_sqlite.py](../app/agent/storage_sqlite.py)。
-- Trace：`trace.node_order` 与 `trace.timings_ms` 为验收字段，单测覆盖。见 [tests/test_agent_graph_trace.py](../tests/test_agent_graph_trace.py)。
+- Session 持久化：唯一后端为 Redis，会在 `PersistState` 时写入裁剪后的 `AgentSessionState`。见 [app/agent/storage.py](../app/agent/storage.py) 与 [app/agent/storage_redis.py](../app/agent/storage_redis.py)。
+- Trace：除 `trace.node_order` 与 `trace.timings_ms` 外，还会记录 `phase0_guardrail`、`record_admission`、`record_conflicts`、`storage` 以及 `rag_stats`。见 [tests/test_agent_graph_trace.py](../tests/test_agent_graph_trace.py)、[tests/test_agent_phase0_guardrail.py](../tests/test_agent_phase0_guardrail.py) 与 [tests/test_agent_longitudinal_record.py](../tests/test_agent_longitudinal_record.py)。
 
 ### 4.4 M4 评测闭环（MedDG 端到端 + RAG 离线 + 性能）
 
@@ -187,6 +190,10 @@ sequenceDiagram
 ## 5. 关键实现亮点（有据可查）
 
 - 统一证据契约与单测回归：M1 `retrieve()` 固定 evidence 字段并由 [tests/test_rag_retrieve_contract.py](../tests/test_rag_retrieve_contract.py) 校验，降低“上游改动导致下游崩”的风险。
+- Faiss-HNSW 单后端：RAG 主索引不再依赖 Chroma，入库与检索都统一走 [app/rag/faiss_store.py](../app/rag/faiss_store.py)，并由 [tests/test_rag_faiss_store.py](../tests/test_rag_faiss_store.py) 覆盖索引落盘、重载与过滤行为。
+- Redis 语义缓存：RAG 检索结果按 query/request shape 写入 Redis，命中后直接复用 evidence，相关元信息可在 `retrieval_meta` 与 `trace.rag_stats` 中观察。见 [tests/test_rag_cache.py](../tests/test_rag_cache.py)。
+- Phase 0 护栏与纵向档案准入：越域/攻击请求在链路最前端短路，稳定病史通过准入逻辑写入 `longitudinal_records`，并以 `record_summary` 参与后续检索与回答安全校验。见 [tests/test_agent_phase0_guardrail.py](../tests/test_agent_phase0_guardrail.py) 与 [tests/test_agent_longitudinal_record.py](../tests/test_agent_longitudinal_record.py)。
+- 结构化主诉检索：`triage` 路径会把 slots 规整成 `chief_complaint`，并构造 `record_summary + 主诉` 检索 query；`kb_qa` 路径继续保留 `问题：原始提问`。见 [tests/test_agent_chief_complaint.py](../tests/test_agent_chief_complaint.py)。
 - Agent 可观测 trace：`run_chat_v2_turn()` 初始化 `trace` 并在每个节点记录 node_order/timings_ms；`RAGRetrieve` 还记录 `trace.rag_stats`。见 [app/agent/graph.py](../app/agent/graph.py) 的 `_trace_start/_trace_end/_node_rag_retrieve/run_chat_v2_turn`。
 - 安全分流与回答护栏：红旗命中直接 escalate（`_node_safety_gate`），Answer 模式输出强制包含引用与免责声明（`_ensure_answer_contract`）。见 [app/agent/graph.py](../app/agent/graph.py)。
 - API 层 fast->safe 强制策略：默认不允许绕过安全链，只有 localhost + `ALLOW_FAST_MODE=1` 才允许 fast。见 [app/api_server.py](../app/api_server.py) 的 `_apply_mode_policy()` 与单测 [tests/test_api_auth.py](../tests/test_api_auth.py)。
@@ -200,7 +207,7 @@ sequenceDiagram
 
 - `/v1/agent/chat_v2` 当前未接入 `X-API-Key` 鉴权（仅 triage/chat/rag_retrieve 有 `_auth_guard`）。若面向公网需补齐鉴权与限流。
 - RAG 质量依赖本地知识库 CSV 与入库参数；目前仓库未提供“黄金标准”标注，因此离线质量评估使用近似指标（bigram Jaccard），只能用于横向对比与回归。
-- LLM 可用性与成本不可控：DeepSeek key 缺失或网络异常时会触发降级路径；不同 LLM 版本可能影响回答风格与可解释性。
+- LLM 可用性与成本不可控：不同 LLM 版本可能影响回答风格与可解释性；生产环境仍需为外部模型调用单独做容量与成本约束。
 
 ---
 

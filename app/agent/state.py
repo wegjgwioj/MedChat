@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 
 TriState = Literal["yes", "no", "unknown"]
 Role = Literal["user", "assistant", "system"]
+RecordCategory = Literal["demographic", "pregnancy", "allergy", "history", "medication"]
 
 
 def utc_now_iso() -> str:
@@ -28,6 +29,15 @@ class Message(BaseModel):
     role: Role
     content: str = Field(default="", description="消息内容（仅保存最近 20 轮）")
     ts: str = Field(default_factory=utc_now_iso, description="UTC 时间戳")
+
+
+class LongitudinalRecordFact(BaseModel):
+    category: RecordCategory
+    label: str = Field(default="", description="展示标签，如 过敏/既往史/用药")
+    value: str = Field(default="", description="事实值，如 青霉素过敏")
+    text: str = Field(default="", description="用于相似度计算的规范化文本")
+    importance_score: float = Field(default=0.0, description="重要性评分，0-1")
+    updated_at: str = Field(default_factory=utc_now_iso, description="最近更新时间")
 
 
 class Slots(BaseModel):
@@ -98,6 +108,7 @@ class AgentSessionState(BaseModel):
     slots: Slots = Field(default_factory=Slots)
     summary: str = Field(default="", description="短摘要，用于构建 rag_query 与 LLM 上下文")
     record_summary: str = Field(default="", description="纵向档案摘要，优先保留年龄/过敏史/既往史/用药等稳定信息")
+    longitudinal_records: List[LongitudinalRecordFact] = Field(default_factory=list, description="纵向档案事实索引，按重要性和相似阈值入库")
 
     # 为动态追问与防重复服务：
     # - asked_slots：历史已追问过的槽位集合（只存字段名）
@@ -170,6 +181,47 @@ def build_summary_from_slots(slots: Slots) -> str:
         parts.append("红旗：" + "、".join([x for x in slots.red_flags if x][:6]))
 
     return "；".join(parts).strip()
+
+
+def build_chief_complaint_from_slots(slots: Slots) -> str:
+    """构建用于检索的结构化主诉。"""
+
+    prefix = ""
+    if slots.age is not None:
+        prefix += f"{int(slots.age)}岁"
+    sex = (slots.sex or "").strip()
+    if sex:
+        prefix += sex
+
+    symptoms = [str(item).strip() for item in (slots.symptoms or []) if str(item).strip()]
+    if slots.fever == "yes" and not any("发热" in item or "发烧" in item for item in symptoms):
+        symptoms.append("发热")
+
+    core = "、".join(symptoms[:6])
+    location = (slots.location or "").strip()
+    if location and core:
+        core = f"{location}{core}"
+    elif location and not core:
+        core = location
+
+    duration = (slots.duration or "").strip()
+    if duration:
+        core = f"{core}{duration}" if core else duration
+
+    parts: List[str] = []
+    if prefix:
+        parts.append(prefix)
+    if core:
+        parts.append(core)
+
+    severity = (slots.severity or "").strip()
+    if severity:
+        parts.append(severity)
+
+    complaint = "，".join([part for part in parts if part]).strip("，")
+    if complaint and not complaint.endswith("。"):
+        complaint += "。"
+    return complaint
 
 
 def to_public_slots_dict(slots: Slots) -> Dict[str, Any]:

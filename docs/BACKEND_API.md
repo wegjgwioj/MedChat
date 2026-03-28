@@ -1,6 +1,6 @@
 # MedCaht 后端 API 文档（仅后端）
 
-版本：2025-12-23
+版本：2026-03-28
 
 说明：
 
@@ -38,7 +38,7 @@
 
 ### 0.3 记录感知安全护栏
 
-- `/v1/agent/chat_v2` 会在会话内维护 `record_summary`，优先保留年龄、既往史、用药和过敏史等稳定信息。
+- `/v1/agent/chat_v2` 会在会话内维护 `longitudinal_records` 与 `record_summary`，优先保留年龄、既往史、用药和过敏史等稳定信息。
 - `/v1/triage` 可传 `clinical_record_path`，后端会读取该文本并对回答中的高风险药物建议做记录感知校验。
 - 当前第一阶段仅覆盖“明确过敏史 -> 明确风险药物名”冲突拦截；命中后会：
   - 在自由文本回答里追加风险提醒
@@ -103,8 +103,12 @@ Schema（来自 Pydantic 模型 `AgentChatV2Response`）：
 
 补充说明：
 
+- `trace.phase0_guardrail`：记录 Phase 0 越域/攻击拦截结果；若 `blocked=true`，链路会在进入 slot extraction 前直接短路。
+- `trace.record_admission`：记录本轮新事实写入纵向档案时的 admitted/merged/dropped 统计。
 - `trace.record_conflicts`：若回答命中过敏史冲突，会返回命中的 `matched_term/record_term/message` 列表；无冲突时为空列表或缺省。
-- `trace.rag_stats`：当前会补充 `cache_hit/cache_mode/hybrid_enabled/search_query/evidence_quality`，便于观察检索是否命中缓存以及是否开启 hybrid。
+- `trace.planner_strategy`：记录当前回答路径是 `kb_qa` 还是 `triage`。
+- `trace.chief_complaint`：当路径为 `triage` 且已生成结构化主诉时返回，便于前端调试和检索验收。
+- `trace.rag_stats`：当前会补充 `backend/cache_hit/cache_mode/cache_backend/hybrid_enabled/search_query/dense_hits/sparse_hits/evidence_quality`，便于观察检索是否命中缓存以及 hybrid 两路召回的命中数。
 
 字段契约（何时为空）：
 
@@ -167,6 +171,7 @@ curl -sS "http://127.0.0.1:8000/v1/rag/stats"
 ### 2.2 响应
 
 - `collection`：string
+- `backend`：string，当前固定为 `faiss-hnsw`
 - `count`：int
 - `persist_dir`：string
 - `device`：string（例如 cpu/cuda/cuda:0）
@@ -200,10 +205,11 @@ curl -sS "http://127.0.0.1:8000/v1/rag/stats"
 - `RAG_VECTOR_MAX_SCORE`：number，可选；无论是否启用 rerank，都先过滤 `score > 阈值` 的证据
 - `RAG_HYBRID_ENABLED`：bool，可选；默认开启，对 dense 候选执行 sparse+dense 混合排序
 - `RAG_HYBRID_ALPHA`：number，可选；hybrid 中 dense 权重，范围 `[0,1]`
-- `RAG_CACHE_ENABLED`：bool，可选；开启进程内语义缓存
+- `RAG_CACHE_ENABLED`：bool，可选；开启 Redis 语义缓存
 - `RAG_CACHE_TTL_SECONDS`：int，可选；缓存 TTL
 - `RAG_CACHE_MAX_ENTRIES`：int，可选；缓存最大条目数
 - `RAG_CACHE_SIM_THRESHOLD`：number，可选；近似 query 复用缓存的相似度阈值
+- `RAG_REDIS_URL` / `AGENT_REDIS_URL`：Redis 缓存连接地址；开启缓存时至少配置其一
 
 Windows PowerShell（带鉴权示例）：
 
@@ -232,8 +238,8 @@ curl -sS "http://127.0.0.1:8000/v1/rag/retrieve" \
 - `use_rerank`：bool（若请求未显式传，则由环境变量推导）
 - `evidence`：array[object]，证据列表
 - `evidence_quality`：object（`level/reason/count/...`，与后端统一证据质量口径一致）
-- `retrieval_meta`：object，最近一次检索的轻量元信息；当前可能包含 `search_query/cache_hit/cache_mode/hybrid_enabled`
-- `stats`：object（collection/count/device/embed_model/rerank_model）
+- `retrieval_meta`：object，最近一次检索的轻量元信息；当前可能包含 `search_query/cache_hit/cache_mode/cache_backend/hybrid_enabled/dense_hits/sparse_hits`
+- `stats`：object（backend/collection/count/device/embed_model/rerank_model）
 
 `evidence` 单条字段契约（由单测保障）：
 
@@ -391,7 +397,7 @@ file=<binary>
 用途：
 
 - 查询 MinerU OCR 状态
-- 首次完成时自动下载 `full_zip_url`，提取文本并写入 Chroma
+- 首次完成时自动下载 `full_zip_url`，提取文本并写入当前 RAG 索引目录
 - 后续重复查询同一 `task_id` 不会重复入库
 
 查询参数：

@@ -47,11 +47,24 @@ def test_redis_session_store_roundtrip_with_fake_client():
 def test_build_session_store_is_redis_only_and_fails_fast(monkeypatch):
     from app.agent import storage
 
+    monkeypatch.delenv("AGENT_REDIS_URL", raising=False)
+    monkeypatch.setenv("AGENT_SESSION_STORE", "sqlite")
+
+    store = storage.build_session_store()
+
+    assert store.storage_meta()["type"] == "sqlite"
+
+
+def test_build_session_store_falls_back_to_sqlite_when_redis_unavailable(monkeypatch):
+    from app.agent import storage
+
     monkeypatch.setenv("AGENT_REDIS_URL", "redis://fake:6379/0")
+    monkeypatch.delenv("AGENT_SESSION_STORE", raising=False)
     monkeypatch.setattr(storage, "_build_redis_session_store", lambda: (_ for _ in ()).throw(RuntimeError("redis down")))
 
-    with pytest.raises(RuntimeError, match="redis down"):
-        storage.build_session_store()
+    store = storage.build_session_store()
+
+    assert store.storage_meta()["type"] == "sqlite"
 
 
 def test_graph_trace_uses_redis_store(monkeypatch):

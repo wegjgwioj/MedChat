@@ -38,8 +38,9 @@ from app.agent.prompts import (
     SLOT_EXTRACTION_SYSTEM,
     SLOT_EXTRACTION_USER_TEMPLATE,
 )
+from app.agent.record_index import build_record_summary_from_records, upsert_longitudinal_records
 from app.agent.storage import SessionStore, build_session_store
-from app.agent.state import AgentSessionState, Slots, build_summary_from_slots
+from app.agent.state import AgentSessionState, Slots, build_chief_complaint_from_slots, build_summary_from_slots
 from app.privacy import redact_pii_for_llm
 from app.rag.evidence_policy import is_low_evidence, summarize_evidence_quality
 from app.safety.conflict_judge import judge_text_conflicts
@@ -54,6 +55,18 @@ logger = logging.getLogger(__name__)
 
 
 Mode = Literal["ask", "answer", "escalate"]
+
+PHASE0_OOD_ANSWER_TEMPLATE = """我只能处理医疗健康相关的问题。
+请直接描述你的症状、持续时间、严重程度、年龄或既往病史，我再继续判断。
+
+免责声明：本回答仅供信息参考，不能替代医生面诊。
+"""
+
+PHASE0_ATTACK_ANSWER_TEMPLATE = """当前请求不属于可执行的医疗问诊输入。
+请直接描述你的症状、持续时间、严重程度、年龄或既往病史，我会按医疗问诊流程继续判断。
+
+免责声明：本回答仅供信息参考，不能替代医生面诊。
+"""
 
 
 class AgentGraphState(TypedDict, total=False):
@@ -428,6 +441,97 @@ def _looks_like_red_flag(text: str) -> List[str]:
 
     hits = pattern_hits + [k for k in keywords if k in msg and k not in pattern_hits]
     return hits[:6]
+
+
+def _classify_phase0_guardrail(text: str) -> Dict[str, Any]:
+    msg = str(text or "").strip()
+    safe_msg = redact_pii_for_llm(msg)
+    lowered = safe_msg.lower()
+
+    attack_terms = [
+        "忽略之前",
+        "忽略以上",
+        "系统提示词",
+        "提示词原文",
+        "越狱",
+        "jailbreak",
+        "ignore previous",
+        "ignore all previous",
+        "system prompt",
+        "developer message",
+    ]
+    attack_hits = [term for term in attack_terms if term in lowered]
+    if attack_hits:
+        return {
+            "blocked": True,
+            "label": "prompt_attack",
+            "hits": attack_hits[:4],
+            "pii_masked": safe_msg != msg,
+            "safe_message_hash": _stable_hash_text(safe_msg),
+        }
+
+    medical_terms = [
+        "头痛",
+        "发热",
+        "发烧",
+        "咳嗽",
+        "腹痛",
+        "腹泻",
+        "呕吐",
+        "胸痛",
+        "呼吸困难",
+        "恶心",
+        "皮疹",
+        "瘙痒",
+        "喉咙",
+        "咽痛",
+        "药",
+        "过敏",
+        "病",
+        "医院",
+        "感染",
+        "传染",
+        "病毒",
+        "细菌",
+        "症状",
+        "疼",
+    ]
+    if any(term in safe_msg for term in medical_terms):
+        return {
+            "blocked": False,
+            "label": "medical",
+            "hits": [],
+            "pii_masked": safe_msg != msg,
+            "safe_message_hash": _stable_hash_text(safe_msg),
+        }
+
+    ood_terms = [
+        "python",
+        "爬虫",
+        "代码",
+        "脚本",
+        "sql",
+        "论文",
+        "股票",
+        "基金",
+        "天气",
+        "翻译",
+        "简历",
+        "作文",
+        "八卦",
+        "明星",
+        "旅游",
+        "游戏",
+    ]
+    ood_hits = [term for term in ood_terms if term in lowered]
+    blocked = bool(ood_hits)
+    return {
+        "blocked": blocked,
+        "label": "out_of_domain" if blocked else "medical",
+        "hits": ood_hits[:4],
+        "pii_masked": safe_msg != msg,
+        "safe_message_hash": _stable_hash_text(safe_msg),
+    }
 
 
 def _guess_department(slots: Slots, user_message: str) -> Optional[str]:
@@ -826,6 +930,38 @@ def _node_safety_gate(state: AgentGraphState) -> Dict[str, Any]:
 
     msg = str(state.get("user_message") or "").strip()
 
+    phase0 = _classify_phase0_guardrail(msg)
+    tr = state.get("trace") if isinstance(state.get("trace"), dict) else {}
+    tr["phase0_guardrail"] = phase0
+    state["trace"] = cast(Dict[str, Any], tr)
+
+    if bool(phase0.get("blocked")):
+        answer = (
+            PHASE0_ATTACK_ANSWER_TEMPLATE
+            if str(phase0.get("label") or "").strip() == "prompt_attack"
+            else PHASE0_OOD_ANSWER_TEMPLATE
+        ).strip()
+        safe_msg = redact_pii_for_llm(msg)
+        if safe_msg:
+            sess.append_message("user", safe_msg)
+        sess.append_message("assistant", answer)
+        state["mode"] = "answer"
+        state["answer"] = answer
+        state["ask_text"] = ""
+        state["questions"] = []
+        state["next_questions"] = []
+        state["citations"] = []
+        _trace_end(state, node, t0)
+        return {
+            "session": sess,
+            "mode": state.get("mode"),
+            "answer": state.get("answer"),
+            "ask_text": state.get("ask_text"),
+            "questions": state.get("questions"),
+            "next_questions": state.get("next_questions"),
+            "citations": state.get("citations"),
+        }
+
     hits = _looks_like_red_flag(msg)
 
     # 记录 safety_flags 到 trace
@@ -868,7 +1004,7 @@ def _node_memory_update(state: AgentGraphState) -> Dict[str, Any]:
     msg = str(state.get("user_message") or "").strip()
 
     # 记录用户消息
-    sess.append_message("user", msg)
+    sess.append_message("user", redact_pii_for_llm(msg))
 
     # ===== 批次1新增：记录更新前的槽位 =====
     old_slots = sess.slots.model_dump()
@@ -886,7 +1022,11 @@ def _node_memory_update(state: AgentGraphState) -> Dict[str, Any]:
 
     # summary 用规则稳定构建
     sess.summary = build_summary_from_slots(sess.slots)
-    sess.record_summary = build_record_summary_from_slots(sess.slots)
+    sess.longitudinal_records, record_admission = upsert_longitudinal_records(
+        sess.longitudinal_records,
+        patch_slots,
+    )
+    sess.record_summary = build_record_summary_from_records(sess.longitudinal_records)
 
     # ===== 批次1新增：记录槽位变化到 trace =====
     new_slots = sess.slots.model_dump()
@@ -896,6 +1036,8 @@ def _node_memory_update(state: AgentGraphState) -> Dict[str, Any]:
     if not isinstance(tr, dict):
         tr = {}
     tr["slots_changed"] = slots_changed
+    tr["record_admission"] = dict(record_admission)
+    tr["record_admission"]["total_records"] = len(sess.longitudinal_records)
     state["trace"] = cast(Dict[str, Any], tr)
 
     _trace_end(state, node, t0)
@@ -993,7 +1135,19 @@ def _node_rag_retrieve(state: AgentGraphState) -> Dict[str, Any]:
     top_n = int(state.get("top_n") or 30)
     use_rerank = bool(state.get("use_rerank") if state.get("use_rerank") is not None else True)
 
-    rag_query_parts = [str(sess.record_summary or "").strip(), str(sess.summary or "").strip(), f"问题：{msg}"]
+    tr_any = state.get("trace")
+    tr: Dict[str, Any] = tr_any if isinstance(tr_any, dict) else {}
+    planner_strategy = str(tr.get("planner_strategy") or "").strip()
+
+    chief_complaint = build_chief_complaint_from_slots(sess.slots)
+    if chief_complaint:
+        tr["chief_complaint"] = chief_complaint
+
+    if planner_strategy == "kb_qa":
+        rag_query_parts = [f"问题：{msg}"]
+    else:
+        structured_query = f"主诉：{chief_complaint}" if chief_complaint else str(sess.summary or "").strip()
+        rag_query_parts = [str(sess.record_summary or "").strip(), structured_query]
     rag_query = "；".join([part for part in rag_query_parts if part]).strip("； ")
 
     dept = sess.slots.department_guess
@@ -1018,9 +1172,8 @@ def _node_rag_retrieve(state: AgentGraphState) -> Dict[str, Any]:
     rag_meta = rag_get_last_retrieval_meta()
 
     st = get_stats()
-    tr_any = state.get("trace")
-    tr: Dict[str, Any] = tr_any if isinstance(tr_any, dict) else {}
     tr["rag_stats"] = {
+        "backend": getattr(st, "backend", "faiss-hnsw"),
         "device": st.device,
         "collection": st.collection,
         "count": st.count,
@@ -1029,7 +1182,15 @@ def _node_rag_retrieve(state: AgentGraphState) -> Dict[str, Any]:
         "evidence_quality": summarize_evidence_quality(evidence),
     }
     if isinstance(rag_meta, dict):
-        for key in ("cache_hit", "cache_mode", "hybrid_enabled", "search_query"):
+        for key in (
+            "cache_hit",
+            "cache_mode",
+            "cache_backend",
+            "hybrid_enabled",
+            "search_query",
+            "dense_hits",
+            "sparse_hits",
+        ):
             if key in rag_meta:
                 tr["rag_stats"][key] = rag_meta.get(key)
     state["trace"] = cast(Dict[str, Any], tr)
@@ -1154,6 +1315,11 @@ def _node_persist_state(state: AgentGraphState) -> Dict[str, Any]:
 
 
 def _route_after_safety(state: AgentGraphState) -> str:
+    tr = state.get("trace")
+    if isinstance(tr, dict):
+        phase0 = tr.get("phase0_guardrail")
+        if isinstance(phase0, dict) and bool(phase0.get("blocked")):
+            return "persist"
     if state.get("mode") == "escalate":
         return "persist"
     return "memory"

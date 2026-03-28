@@ -25,6 +25,27 @@ def test_memory_update_fails_fast_when_slot_extraction_errors(monkeypatch):
         graph._node_memory_update(state)
 
 
+def test_memory_update_fails_fast_when_record_admission_errors(monkeypatch):
+    from app.agent import graph
+    from app.agent.state import AgentSessionState
+
+    monkeypatch.setattr(graph, "_extract_slots_with_llm", graph._rule_extract_slots)
+    monkeypatch.setattr(
+        graph,
+        "upsert_longitudinal_records",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("record index down")),
+    )
+
+    state = {
+        "session": AgentSessionState(session_id="strict-record"),
+        "user_message": "我青霉素过敏。",
+        "trace": {},
+    }
+
+    with pytest.raises(RuntimeError, match="record index down"):
+        graph._node_memory_update(state)
+
+
 def test_rag_retrieve_fails_fast_when_backend_errors(monkeypatch):
     from app.agent import graph
     from app.agent.state import AgentSessionState

@@ -17,7 +17,7 @@ def _is_number(v: Any) -> bool:
 def test_rag_retrieve_contract_basic() -> None:
     """验证 evidence 契约字段齐全、eid 连续、text 非空、top_k 生效。
 
-    说明：该测试依赖本地已完成入库的 Chroma 持久化目录（默认 app/rag/kb_store）。
+    说明：该测试依赖本地已完成入库的 Faiss-HNSW 持久化目录（默认 app/rag/kb_store）。
     """
 
     from app.rag.rag_core import retrieve

@@ -14,19 +14,19 @@ FastAPI Router (app/agent/router.py)
   v
 LangGraph Orchestration (app/agent/graph.py)
   |
-  +-- N1 SafetyGate      ：红旗症状识别 -> escalate
-  +-- N2 MemoryUpdate    ：槽位抽取/更新 session_state
+  +-- N1 SafetyGate      ：Phase 0 护栏 + 红旗症状识别
+  +-- N2 MemoryUpdate    ：槽位抽取/更新 session_state + longitudinal record admission
   +-- N3 TriagePlanner   ：判断缺口 -> ask / answer
-  +-- N4 RAGRetrieve     ：调用 M1 RAG（Chroma + 可选 rerank）
+  +-- N4 RAGRetrieve     ：调用 M1 RAG（Faiss-HNSW + dual-path hybrid + Redis cache）
   +-- N5 AnswerCompose   ：LLM 生成回答（带引用 [E1][E2]）
-  +-- N6 PersistState    ：SQLite 持久化（app/data/agent_sessions.sqlite3）
+  +-- N6 PersistState    ：Redis 持久化
 ```
 
 ## 2. 会话状态（Session State）
 
-- 使用 SQLite 持久化：`app/data/agent_sessions.sqlite3`
-- 表：`sessions(session_id PRIMARY KEY, state_json TEXT, updated_at)`
+- 使用 Redis 持久化：由 `AGENT_REDIS_URL` 指定连接
 - 仅保存最近 20 轮 messages，避免上下文爆炸
+- 额外维护 `longitudinal_records` 与 `record_summary`
 
 ## 3. API
 
@@ -55,7 +55,7 @@ LangGraph Orchestration (app/agent/graph.py)
   "citations": [{"eid":"E1","score":0.1,"department":"内科","title":"...","snippet":"...","source":"...","chunk_id":"...","rerank_score":null}],
   "slots": {"age":30, "sex":"男", "symptoms":["咳嗽"], "duration":"3天", "fever":"unknown", "department_guess":"内科", "red_flags":[]},
   "summary": "...",
-  "trace": {"node_order":["N1_SafetyGate"],"node_ms":{"N1_SafetyGate":1},"rag":{"hits":3}}
+  "trace": {"node_order":["SafetyGate"],"timings_ms":{"SafetyGate":1},"phase0_guardrail":{"blocked":false},"rag_stats":{"backend":"faiss-hnsw","hits":3}}
 }
 ```
 
@@ -101,11 +101,7 @@ curl.exe -X POST "http://127.0.0.1:8000/v1/agent/chat_v2" `
 
 ### 5.1 如何清理 session
 
-最简单方式：删除 SQLite 文件。
-
-- `app/data/agent_sessions.sqlite3`
-
-或自行写脚本调用 `SqliteSessionStore.delete_session(session_id)`。
+最简单方式：用 Redis 客户端删除对应 key，或自行写脚本调用 `RedisSessionStore.delete_session(session_id)`。
 
 ### 5.2 为什么日志里看不到完整 user_message
 
@@ -113,5 +109,5 @@ curl.exe -X POST "http://127.0.0.1:8000/v1/agent/chat_v2" `
 
 ### 5.3 LLM 不可用怎么办
 
-- 会自动降级为规则抽取槽位 + 模板回答。
-- 若要定位问题，请检查 `DEEPSEEK_API_KEY` 是否正确。
+- 主链路按严格模式执行，不做静默降级。
+- 若要定位问题，请检查 `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL` 与模型可用性。

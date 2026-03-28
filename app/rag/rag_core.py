@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """rag_core.py
 
-M1：RAGService 核心实现（进程内直连版本）。
+M1：RAGService 核心实现（Faiss-HNSW 版本）。
 
 目标：
 - 统一入库与检索的 embedding 配置（默认 BCEmbedding bce-embedding-base_v1，GPU 优先）。
-- 两阶段检索：Chroma 向量召回 top_n -> 可选 BCEmbedding reranker 重排 -> 返回 top_k。
+- 两阶段检索：Faiss-HNSW dense 召回 top_n -> 可选 BCEmbedding reranker 重排 -> 返回 top_k。
 - 固定 evidence 契约：retrieve() 返回 List[Dict] 且字段齐全，可直接被 triage_service.py 使用。
 
 说明：
@@ -17,15 +17,17 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import re
 import threading
 import time
-from collections import OrderedDict
-from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from app.rag.cache_redis import RedisSemanticCache
+from app.rag.faiss_store import FaissHNSWStore
 
 from app.rag.utils.rag_shared import (
     DEFAULT_COLLECTION,
@@ -44,6 +46,7 @@ from app.privacy import redact_pii_for_llm
 
 @dataclass(frozen=True)
 class RagStats:
+    backend: str
     collection: str
     count: int
     persist_dir: str
@@ -53,15 +56,10 @@ class RagStats:
     updated_at: str
 
 
-@dataclass
-class _CacheEntry:
-    cache_key: str
-    request_key: str
-    normalized_query: str
-    query_tokens: Tuple[str, ...]
-    created_at: float
-    expires_at: float
-    items: List[Dict[str, Any]]
+@dataclass(frozen=True)
+class _DocLike:
+    page_content: str
+    metadata: Dict[str, Any]
 
 
 _embed_lock = threading.Lock()
@@ -73,7 +71,7 @@ _runtime_lock = threading.Lock()
 _cached_embed: Optional[Tuple[Any, EmbeddingInfo]] = None
 _cached_reranker: Optional[Any] = None
 _cached_vs: Optional[Any] = None
-_retrieval_cache: "OrderedDict[str, _CacheEntry]" = OrderedDict()
+_cache_backend: Optional[RedisSemanticCache] = None
 _last_retrieval_meta: Dict[str, Any] = {}
 
 
@@ -240,7 +238,7 @@ def clear_runtime_state() -> None:
     """Reset module runtime caches for tests and local debugging."""
 
     global _cached_embed, _cached_reranker, _cached_vs
-    global _retrieval_cache, _last_retrieval_meta
+    global _cache_backend, _last_retrieval_meta
 
     with _embed_lock:
         _cached_embed = None
@@ -249,7 +247,7 @@ def clear_runtime_state() -> None:
     with _vs_lock:
         _cached_vs = None
     with _cache_lock:
-        _retrieval_cache = OrderedDict()
+        _cache_backend = None
     with _runtime_lock:
         _last_retrieval_meta = {}
 
@@ -286,18 +284,10 @@ def _tokenize_text(text: str) -> List[str]:
     return tokens
 
 
-def _token_jaccard(a: Tuple[str, ...], b: Tuple[str, ...]) -> float:
-    sa = set(a)
-    sb = set(b)
-    if not sa or not sb:
-        return 0.0
-    return len(sa & sb) / float(len(sa | sb))
-
-
 def _normalize_dense_relevance(items: List[Dict[str, Any]]) -> List[float]:
     scores: List[float] = []
     for item in items:
-        score = item.get("score")
+        score = item.get("hybrid_dense_score", item.get("score"))
         if isinstance(score, (int, float)) and not isinstance(score, bool):
             scores.append(float(score))
         else:
@@ -373,6 +363,59 @@ def _compute_sparse_scores(query: str, items: List[Dict[str, Any]]) -> List[floa
     return scores
 
 
+def _load_sparse_docs(*, department: Optional[str] = None) -> List[_DocLike]:
+    vs = get_vectordb()
+    dept = (department or "").strip()
+    where = {"department": dept} if dept else None
+    result = vs.get_documents(where=where)
+    if not isinstance(result, dict):
+        raise RuntimeError("Faiss store.get_documents 返回格式非法。")
+
+    documents = list(result.get("documents") or [])
+    metadatas = list(result.get("metadatas") or [])
+
+    out: List[_DocLike] = []
+    for idx, raw_text in enumerate(documents):
+        text = str(raw_text or "").strip()
+        if not text:
+            continue
+        raw_meta = metadatas[idx] if idx < len(metadatas) else {}
+        meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+        if dept and str(meta.get("department") or "").strip() != dept:
+            continue
+        out.append(_DocLike(page_content=text, metadata=meta))
+    return out
+
+
+def _sparse_search(
+    query: str,
+    *,
+    top_n: int,
+    department: Optional[str] = None,
+) -> List[Tuple[Any, float]]:
+    docs = _load_sparse_docs(department=department)
+    if not docs:
+        return []
+
+    items = [
+        {
+            "text": str(doc.page_content or "").strip(),
+            "score": 0.0,
+        }
+        for doc in docs
+    ]
+    sparse_scores = _compute_sparse_scores(query, items)
+    ranked: List[Tuple[float, int, _DocLike]] = []
+    for idx, (doc, score) in enumerate(zip(docs, sparse_scores)):
+        if float(score) <= 0:
+            continue
+        ranked.append((float(score), -idx, doc))
+
+    ranked.sort(reverse=True)
+    limit = max(1, int(top_n))
+    return [(doc, score) for score, _, doc in ranked[:limit]]
+
+
 def _apply_hybrid_ranking(query: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not _env_hybrid_enabled() or len(items) <= 1:
         return items
@@ -394,6 +437,59 @@ def _apply_hybrid_ranking(query: str, items: List[Dict[str, Any]]) -> List[Dict[
 
     ranked.sort(reverse=True)
     return [item for _, _, _, _, item in ranked]
+
+
+def _merge_hybrid_candidates(
+    *,
+    dense_items: List[Dict[str, Any]],
+    sparse_items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+
+    for item in dense_items + sparse_items:
+        chunk_id = str(item.get("chunk_id") or "").strip()
+        source = str(item.get("source") or "").strip()
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        source_file = str(metadata.get("source_file") or source).strip()
+        row = metadata.get("row")
+        row_key = f"{source_file}:{row}" if source_file and row is not None else ""
+        key = row_key or chunk_id or f"{source}|{str(item.get('text') or '').strip()}"
+        if key not in merged:
+            merged[key] = dict(item)
+            order.append(key)
+            continue
+
+        existing = merged[key]
+        incoming_is_sparse_only = (
+            isinstance(item.get("hybrid_dense_score"), (int, float))
+            and float(item.get("hybrid_dense_score") or 0.0) >= 1.0
+            and float(item.get("score") or 0.0) == 0.0
+        )
+        existing_has_real_dense = not (
+            isinstance(existing.get("hybrid_dense_score"), (int, float))
+            and float(existing.get("hybrid_dense_score") or 0.0) >= 1.0
+            and float(existing.get("score") or 0.0) == 0.0
+        )
+        if not incoming_is_sparse_only or not existing_has_real_dense:
+            if not isinstance(existing.get("score"), (int, float)) or float(item.get("score") or 0.0) < float(existing.get("score") or 0.0):
+                existing["score"] = float(item.get("score") or 0.0)
+
+        existing_text = str(existing.get("text") or "").strip()
+        new_text = str(item.get("text") or "").strip()
+        if len(new_text) > len(existing_text):
+            existing["text"] = new_text
+
+        existing_meta = existing.get("metadata") if isinstance(existing.get("metadata"), dict) else {}
+        new_meta = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        if isinstance(existing_meta, dict) and isinstance(new_meta, dict):
+            merged_meta = dict(existing_meta)
+            for mk, mv in new_meta.items():
+                if mk not in merged_meta or merged_meta[mk] in {"", None}:
+                    merged_meta[mk] = mv
+            existing["metadata"] = merged_meta
+
+    return [merged[key] for key in order]
 
 
 def _build_cache_request_key(
@@ -421,18 +517,24 @@ def _build_cache_request_key(
     )
 
 
-def _build_cache_key(normalized_query: str, request_key: str) -> str:
-    return f"{request_key}|query={normalized_query}"
+def _resolve_cache_redis_url() -> str:
+    return (env_str("RAG_REDIS_URL", "").strip() or str(os.getenv("AGENT_REDIS_URL") or "").strip())
 
 
-def _prune_cache(now: float) -> None:
-    expired = [key for key, entry in _retrieval_cache.items() if entry.expires_at <= now]
-    for key in expired:
-        _retrieval_cache.pop(key, None)
+def _get_cache_backend() -> RedisSemanticCache:
+    global _cache_backend
 
-    max_entries = _env_cache_max_entries()
-    while len(_retrieval_cache) > max_entries:
-        _retrieval_cache.popitem(last=False)
+    with _cache_lock:
+        if _cache_backend is not None:
+            return _cache_backend
+
+        redis_url = _resolve_cache_redis_url()
+        if not redis_url:
+            raise RuntimeError("已启用 RAG Redis 语义缓存，但未配置 RAG_REDIS_URL 或 AGENT_REDIS_URL。")
+
+        key_prefix = (env_str("RAG_CACHE_KEY_PREFIX", "").strip() or "medchat:rag-cache:")
+        _cache_backend = RedisSemanticCache(redis_url=redis_url, key_prefix=key_prefix)
+        return _cache_backend
 
 
 def _lookup_cache(
@@ -442,30 +544,19 @@ def _lookup_cache(
     request_key: str,
 ) -> Tuple[Optional[List[Dict[str, Any]]], Dict[str, Any]]:
     if not _env_cache_enabled():
-        return None, {"cache_hit": False, "cache_mode": None}
+        return None, {"cache_hit": False, "cache_mode": None, "cache_backend": None}
 
-    now = time.monotonic()
-    exact_key = _build_cache_key(normalized_query, request_key)
-
-    with _cache_lock:
-        _prune_cache(now)
-
-        exact_entry = _retrieval_cache.get(exact_key)
-        if exact_entry is not None:
-            _retrieval_cache.move_to_end(exact_key)
-            return deepcopy(exact_entry.items), {"cache_hit": True, "cache_mode": "exact", "cache_similarity": 1.0}
-
-        sim_threshold = _env_cache_sim_threshold()
-        for key in list(_retrieval_cache.keys())[::-1]:
-            entry = _retrieval_cache.get(key)
-            if entry is None or entry.request_key != request_key:
-                continue
-            sim = _token_jaccard(query_tokens, entry.query_tokens)
-            if sim >= sim_threshold:
-                _retrieval_cache.move_to_end(key)
-                return deepcopy(entry.items), {"cache_hit": True, "cache_mode": "semantic", "cache_similarity": round(sim, 4)}
-
-    return None, {"cache_hit": False, "cache_mode": None}
+    try:
+        cache = _get_cache_backend()
+    except Exception:
+        return None, {"cache_hit": False, "cache_mode": None, "cache_backend": None}
+    return cache.lookup(
+        normalized_query=normalized_query,
+        query_tokens=query_tokens,
+        request_key=request_key,
+        sim_threshold=_env_cache_sim_threshold(),
+        max_entries=_env_cache_max_entries(),
+    )
 
 
 def _store_cache(
@@ -478,21 +569,18 @@ def _store_cache(
     if not _env_cache_enabled():
         return
 
-    now = time.monotonic()
-    ttl_seconds = float(_env_cache_ttl_seconds())
-    entry = _CacheEntry(
-        cache_key=_build_cache_key(normalized_query, request_key),
-        request_key=request_key,
+    try:
+        cache = _get_cache_backend()
+    except Exception:
+        return
+    cache.store(
         normalized_query=normalized_query,
         query_tokens=query_tokens,
-        created_at=now,
-        expires_at=now + ttl_seconds,
-        items=deepcopy(items),
+        request_key=request_key,
+        items=items,
+        ttl_seconds=float(_env_cache_ttl_seconds()),
+        max_entries=_env_cache_max_entries(),
     )
-    with _cache_lock:
-        _retrieval_cache[entry.cache_key] = entry
-        _retrieval_cache.move_to_end(entry.cache_key)
-        _prune_cache(now)
 
 
 def get_embedder() -> Tuple[Any, EmbeddingInfo]:
@@ -603,8 +691,8 @@ def get_reranker() -> Optional[Any]:
         return _cached_reranker
 
 
-def get_vectordb() -> Any:
-    """获取 Chroma 向量库对象（单例缓存）。"""
+def get_vectordb() -> FaissHNSWStore:
+    """获取 Faiss-HNSW 向量库对象（单例缓存）。"""
     global _cached_vs
     if _cached_vs is not None:
         return _cached_vs
@@ -615,26 +703,12 @@ def get_vectordb() -> Any:
 
         app_dir = resolve_app_dir(Path(__file__))
         persist_dir = resolve_persist_dir(app_dir)
-        if not persist_dir.exists():
-            raise FileNotFoundError(
-                f"找不到 Chroma 持久化目录：{persist_dir}。请先运行 app/rag/ingest_kb.py 完成入库。"
-            )
-
         collection_name = env_str("RAG_COLLECTION", "") or DEFAULT_COLLECTION
         embeddings, _ = get_embedder()
-
-        try:
-            from langchain.vectorstores import Chroma  # type: ignore
-        except Exception as e:
-            raise RuntimeError(
-                "缺少 langchain 依赖，无法构建 Chroma 向量库。\n"
-                "解决：安装 requirements.txt 中的依赖（langchain、chromadb）。"
-            ) from e
-
-        _cached_vs = Chroma(
-            collection_name=collection_name,
+        _cached_vs = FaissHNSWStore(
+            persist_dir=persist_dir,
             embedding_function=embeddings,
-            persist_directory=str(persist_dir),
+            collection_name=collection_name,
         )
         return _cached_vs
 
@@ -647,52 +721,16 @@ def _vector_search(
 ) -> List[Tuple[Any, float]]:
     """第一阶段向量检索：返回 (doc, score) 列表。
 
-    department 过滤：优先尝试使用 Chroma filter；若不支持则降级为客户端过滤。
+    department 过滤：由 store 接口统一实现。
     """
     vs = get_vectordb()
 
     k = max(1, int(top_n))
     dept = (department or "").strip()
 
-    # 优先尝试原生 filter
     if dept:
-        try:
-            return vs.similarity_search_with_score(query, k=k, filter={"department": dept})
-        except TypeError:
-            pass
-        except Exception:
-            # 某些版本在 filter 参数上会抛运行时错误，降级处理。
-            pass
-
-    docs_scores: List[Tuple[Any, float]] = vs.similarity_search_with_score(query, k=k)
-
-    if not dept:
-        return docs_scores
-
-    # 客户端过滤：尽量补足到 k
-    filtered: List[Tuple[object, float]] = []
-    for doc, score in docs_scores:
-        md = getattr(doc, "metadata", None) or {}
-        if str(md.get("department") or "").strip() == dept:
-            filtered.append((doc, score))
-
-    if len(filtered) >= k:
-        return filtered[:k]
-
-    # 可能需要更大范围召回再过滤补足
-    try:
-        docs_scores2 = vs.similarity_search_with_score(query, k=min(max(k * 4, 50), 200))
-    except Exception:
-        return filtered
-
-    for doc, score in docs_scores2:
-        md = getattr(doc, "metadata", None) or {}
-        if str(md.get("department") or "").strip() == dept:
-            filtered.append((doc, score))
-        if len(filtered) >= k:
-            break
-
-    return filtered[:k]
+        return vs.similarity_search_with_score(query, k=k, filter={"department": dept})
+    return vs.similarity_search_with_score(query, k=k)
 
 
 def _normalize_evidence_item(
@@ -817,12 +855,20 @@ def retrieve(
     """
     q = (query or "").strip()
     if not q:
-        _set_last_retrieval_meta({"query": "", "cache_hit": False, "cache_mode": None, "hybrid_enabled": _env_hybrid_enabled()})
+        _set_last_retrieval_meta(
+            {
+                "query": "",
+                "cache_hit": False,
+                "cache_mode": None,
+                "cache_backend": "redis" if _env_cache_enabled() else None,
+                "hybrid_enabled": _env_hybrid_enabled(),
+            }
+        )
         return []
 
     try:
         vs = get_vectordb()
-        if int(vs._collection.count()) <= 0:  # type: ignore[attr-defined]
+        if int(vs.count()) <= 0:
             _set_last_retrieval_meta(
                 {
                     "query": q,
@@ -834,6 +880,7 @@ def retrieve(
                     "hybrid_enabled": _env_hybrid_enabled(),
                     "cache_hit": False,
                     "cache_mode": None,
+                    "cache_backend": "redis" if _env_cache_enabled() else None,
                     "hits": 0,
                 }
             )
@@ -872,6 +919,8 @@ def retrieve(
         "department": (department or "").strip(),
         "use_rerank": do_rerank,
         "hybrid_enabled": hybrid_enabled,
+        "dense_hits": 0,
+        "sparse_hits": 0,
     }
 
     cached_items, cache_meta = _lookup_cache(
@@ -886,17 +935,30 @@ def retrieve(
         _set_last_retrieval_meta(hit_meta)
         return cached_items
 
-    # 使用 search_q 进行向量召回
-    docs_scores = _vector_search(search_q, top_n=n, department=department)
-
-    items: List[Dict[str, Any]] = []
-    for i, (doc, score) in enumerate(docs_scores, start=1):
+    dense_docs_scores = _vector_search(search_q, top_n=n, department=department)
+    dense_items: List[Dict[str, Any]] = []
+    for i, (doc, score) in enumerate(dense_docs_scores, start=1):
         it = _normalize_evidence_item(idx=i, doc=doc, score=float(score) if score is not None else score)
-        # text 不能为空（契约要求）
         if not str(it.get("text") or "").strip():
             continue
-        items.append(it)
+        it["hybrid_dense_score"] = float(it.get("score") or 0.0)
+        dense_items.append(it)
 
+    sparse_items: List[Dict[str, Any]] = []
+    if hybrid_enabled:
+        sparse_docs_scores = _sparse_search(search_q, top_n=n, department=department)
+        for i, (doc, sparse_score) in enumerate(sparse_docs_scores, start=1):
+            it = _normalize_evidence_item(idx=i, doc=doc, score=0.0)
+            if not str(it.get("text") or "").strip():
+                continue
+            it["hybrid_dense_score"] = 1.0
+            it["hybrid_sparse_score"] = float(sparse_score)
+            sparse_items.append(it)
+        base_meta["sparse_hits"] = len(sparse_items)
+
+    base_meta["dense_hits"] = len(dense_items)
+
+    items = _merge_hybrid_candidates(dense_items=dense_items, sparse_items=sparse_items)
     items = _apply_hybrid_ranking(search_q, items)
     if do_rerank and items:
         # 重排建议使用原句 q，因为精排模型需要上下文
@@ -908,6 +970,8 @@ def retrieve(
     items = items[:k]
     for i, it in enumerate(items, start=1):
         it["eid"] = f"E{i}"
+        it.pop("hybrid_dense_score", None)
+        it.pop("hybrid_sparse_score", None)
 
     _store_cache(
         normalized_query=normalized_query,
@@ -916,6 +980,7 @@ def retrieve(
         items=items,
     )
     miss_meta = dict(base_meta)
+    miss_meta.update(cache_meta)
     miss_meta.update({"cache_hit": False, "cache_mode": None, "hits": len(items)})
     _set_last_retrieval_meta(miss_meta)
     return items
@@ -930,7 +995,7 @@ def get_stats() -> RagStats:
     collection_name = env_str("RAG_COLLECTION", "") or DEFAULT_COLLECTION
 
     try:
-        count = int(vs._collection.count())  # type: ignore[attr-defined]
+        count = int(vs.count())
     except Exception:
         count = 0
 
@@ -938,23 +1003,17 @@ def get_stats() -> RagStats:
 
     rerank_model = _env_rerank_model() if _env_use_reranker() else None
 
-    # updated_at：优先 ingest_progress.json，其次 sqlite
+    backend = getattr(vs, "backend_name", "faiss-hnsw")
     updated_at = ""
     try:
-        candidates = [
-            persist_dir / "ingest_progress.json",
-            persist_dir / "chroma.sqlite3",
-        ]
-        ts = 0.0
-        for p in candidates:
-            if p.exists():
-                ts = max(ts, p.stat().st_mtime)
+        ts = float(getattr(vs, "updated_at", lambda: 0.0)())
         if ts > 0:
             updated_at = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         updated_at = ""
 
     return RagStats(
+        backend=str(backend),
         collection=collection_name,
         count=count,
         persist_dir=str(persist_dir),

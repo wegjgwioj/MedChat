@@ -17,6 +17,8 @@ export default function DebugTrace(props: DebugTraceProps) {
   const rag = props.trace?.rag_stats
   const timings = props.trace?.timings_ms ?? props.trace?.timings
   const nodeOrder = props.trace?.node_order
+  const plannerStrategy = props.trace?.planner_strategy
+  const chiefComplaint = props.trace?.chief_complaint
   const slotKeys = safeKeys(props.slots)
 
   return (
@@ -44,7 +46,18 @@ export default function DebugTrace(props: DebugTraceProps) {
           <div className="debugK">latency_ms</div>
           <div className="debugV">{typeof rag?.latency_ms === 'number' ? rag.latency_ms : '-'}</div>
         </div>
+        <div className="debugItem">
+          <div className="debugK">planner</div>
+          <div className="debugV">{plannerStrategy ?? '-'}</div>
+        </div>
       </div>
+
+      {chiefComplaint ? (
+        <div className="debugTimings">
+          <div className="debugSub">结构化主诉</div>
+          <div className="slotKeys">{chiefComplaint}</div>
+        </div>
+      ) : null}
 
       {Array.isArray(nodeOrder) && nodeOrder.length ? (
         <div className="debugTimings">

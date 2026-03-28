@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from tests.conftest import FakeRagStore
+
 
 class _FakeDoc:
     def __init__(self, text: str, source_file: str):
@@ -22,18 +24,17 @@ def _fake_vector_docs():
     ]
 
 
+def _fake_store(size: int):
+    docs = _fake_vector_docs()[:size]
+    rows = [{"page_content": doc.page_content, "metadata": dict(doc.metadata)} for doc, _ in docs]
+    return FakeRagStore(rows=rows, count=size)
+
+
 def test_retrieve_filters_out_items_below_rerank_threshold(monkeypatch) -> None:
     import app.rag.rag_core as rag_core
 
-    class FakeCollection:
-        def count(self) -> int:
-            return 3
-
-    class FakeVS:
-        _collection = FakeCollection()
-
     monkeypatch.setenv("RAG_RERANK_MIN_SCORE", "0.80")
-    monkeypatch.setattr(rag_core, "get_vectordb", lambda: FakeVS())
+    monkeypatch.setattr(rag_core, "get_vectordb", lambda: _fake_store(3))
     monkeypatch.setattr(rag_core, "_vector_search", lambda query, top_n, department=None: _fake_vector_docs())
     monkeypatch.setattr(rag_core, "_env_use_reranker", lambda: True)
 
@@ -55,15 +56,8 @@ def test_retrieve_filters_out_items_below_rerank_threshold(monkeypatch) -> None:
 def test_retrieve_returns_empty_when_all_items_below_rerank_threshold(monkeypatch) -> None:
     import app.rag.rag_core as rag_core
 
-    class FakeCollection:
-        def count(self) -> int:
-            return 2
-
-    class FakeVS:
-        _collection = FakeCollection()
-
     monkeypatch.setenv("RAG_RERANK_MIN_SCORE", "0.95")
-    monkeypatch.setattr(rag_core, "get_vectordb", lambda: FakeVS())
+    monkeypatch.setattr(rag_core, "get_vectordb", lambda: _fake_store(2))
     monkeypatch.setattr(rag_core, "_vector_search", lambda query, top_n, department=None: _fake_vector_docs()[:2])
     monkeypatch.setattr(rag_core, "_env_use_reranker", lambda: True)
 
@@ -80,15 +74,8 @@ def test_retrieve_returns_empty_when_all_items_below_rerank_threshold(monkeypatc
 def test_retrieve_filters_out_items_above_vector_score_threshold_without_rerank(monkeypatch) -> None:
     import app.rag.rag_core as rag_core
 
-    class FakeCollection:
-        def count(self) -> int:
-            return 2
-
-    class FakeVS:
-        _collection = FakeCollection()
-
     monkeypatch.setenv("RAG_VECTOR_MAX_SCORE", "0.15")
-    monkeypatch.setattr(rag_core, "get_vectordb", lambda: FakeVS())
+    monkeypatch.setattr(rag_core, "get_vectordb", lambda: _fake_store(2))
     monkeypatch.setattr(rag_core, "_vector_search", lambda query, top_n, department=None: _fake_vector_docs()[:2])
     monkeypatch.setattr(rag_core, "_env_use_reranker", lambda: False)
 

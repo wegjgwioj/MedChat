@@ -1,6 +1,7 @@
 import os
 import sys
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -80,6 +81,17 @@ def fake_agent_session_redis(monkeypatch):
     )
 
     try:
+        from app.rag.cache_redis import RedisSemanticCache
+
+        monkeypatch.setattr(
+            RedisSemanticCache,
+            "_create_client",
+            staticmethod(lambda _redis_url: _FakeRedisClient()),
+        )
+    except Exception:
+        pass
+
+    try:
         import app.agent.graph as graph
 
         monkeypatch.setattr(graph, "_STORE", None, raising=False)
@@ -87,5 +99,54 @@ def fake_agent_session_redis(monkeypatch):
     except Exception:
         pass
 
+    try:
+        import app.rag.rag_core as rag_core
+
+        rag_core.clear_runtime_state()
+    except Exception:
+        pass
+
     yield
+
+
+class FakeRagStore:
+    def __init__(self, rows: Optional[List[Dict[str, Any]]] = None, count: Optional[int] = None):
+        self._rows = list(rows or [])
+        self._count = int(count) if count is not None else len(self._rows)
+        self.backend_name = "faiss-hnsw"
+        self.collection_name = "pytest_kb"
+        self.persist_dir = "pytest"
+
+    def count(self) -> int:
+        return self._count
+
+    def similarity_search_with_score(self, query: str, *, k: int, filter: Optional[Dict[str, Any]] = None):
+        try:
+            from langchain.schema import Document  # type: ignore
+        except Exception:
+            from langchain_core.documents import Document  # type: ignore
+
+        out = []
+        for row in self._rows:
+            metadata = dict(row.get("metadata") or {})
+            if filter and any(metadata.get(key) != value for key, value in filter.items()):
+                continue
+            out.append((Document(page_content=str(row.get("page_content") or ""), metadata=metadata), float(row.get("score") or 0.0)))
+            if len(out) >= max(1, int(k)):
+                break
+        return out
+
+    def get_documents(self, where: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        documents: List[str] = []
+        metadatas: List[Dict[str, Any]] = []
+        for row in self._rows:
+            metadata = dict(row.get("metadata") or {})
+            if where and any(metadata.get(key) != value for key, value in where.items()):
+                continue
+            documents.append(str(row.get("page_content") or ""))
+            metadatas.append(metadata)
+        return {"documents": documents, "metadatas": metadatas}
+
+    def updated_at(self) -> float:
+        return 0.0
 

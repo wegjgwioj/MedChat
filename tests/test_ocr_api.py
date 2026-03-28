@@ -77,7 +77,7 @@ def test_ocr_status_is_idempotent_for_same_task(monkeypatch, tmp_path: Path):
     calls = {"add": 0, "persist": 0}
 
     class FakeVS:
-        def add_texts(self, texts, metadatas=None):
+        def add_documents(self, documents):
             calls["add"] += 1
 
         def persist(self):
@@ -95,6 +95,60 @@ def test_ocr_status_is_idempotent_for_same_task(monkeypatch, tmp_path: Path):
     assert resp2.json()["ingested"] is True
     assert calls["add"] == 1
     assert calls["persist"] == 1
+
+
+def test_ocr_status_chunks_long_text_before_ingest(monkeypatch, tmp_path: Path):
+    import app.api_server as api_server
+
+    monkeypatch.setenv("RAG_CHUNK_SIZE", "4")
+    monkeypatch.setenv("RAG_CHUNK_OVERLAP", "1")
+
+    store = _setup_ocr_store(api_server, tmp_path)
+    monkeypatch.setattr(api_server, "_OCR_STORE", store, raising=False)
+    store.upsert_ocr_task(
+        task_id="task-long-ocr",
+        session_id="s-long",
+        source_url="https://example.com/long.pdf",
+        source_name="long.pdf",
+        source_kind="url",
+        status="pending",
+        trace_id="trace-long",
+    )
+
+    monkeypatch.setattr(
+        api_server,
+        "_get_mineru_task_status",
+        lambda task_id: {"task_id": task_id, "status": "done", "done": True, "trace_id": "trace-long", "full_zip_url": "https://example.com/full.zip"},
+        raising=False,
+    )
+    monkeypatch.setattr(api_server, "_download_mineru_result_zip", lambda url: b"zip-bytes", raising=False)
+    monkeypatch.setattr(
+        api_server,
+        "_extract_mineru_text_from_zip",
+        lambda zip_bytes: (
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu",
+            {"picked": "result.md"},
+        ),
+        raising=False,
+    )
+
+    captured = {"chunks": 0}
+
+    class FakeVS:
+        def add_documents(self, documents):
+            captured["chunks"] = len(documents)
+
+        def persist(self):
+            return None
+
+    monkeypatch.setattr(api_server, "_get_vectordb_for_ocr", lambda: FakeVS(), raising=False)
+
+    client = TestClient(api_server.app)
+    resp = client.get("/v1/ocr/status/task-long-ocr")
+
+    assert resp.status_code == 200
+    assert resp.json()["ingested"] is True
+    assert captured["chunks"] >= 2
 
 
 def test_ocr_ingest_accepts_file_upload(monkeypatch, tmp_path: Path):

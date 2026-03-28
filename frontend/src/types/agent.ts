@@ -27,6 +27,8 @@ export type AgentTrace = {
   // 兼容旧字段（历史版本）
   timings?: AgentTraceTimings
   rag_stats?: AgentRagStats
+  planner_strategy?: string
+  chief_complaint?: string
 }
 
 export type AgentQuestion = {

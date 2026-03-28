@@ -1153,6 +1153,7 @@ def rag_stats() -> Dict[str, Any]:
 
     st = get_stats()
     return {
+        "backend": getattr(st, "backend", "faiss-hnsw"),
         "collection": st.collection,
         "count": st.count,
         "persist_dir": st.persist_dir,
@@ -1207,6 +1208,7 @@ def rag_retrieve(
         "evidence_quality": summarize_evidence_quality(evidence),
         "retrieval_meta": retrieval_meta,
         "stats": {
+            "backend": getattr(st, "backend", "faiss-hnsw"),
             "collection": st.collection,
             "count": st.count,
             "device": st.device,
@@ -1359,7 +1361,7 @@ def ocr_status(
     zip_bytes = _download_mineru_result_zip(full_zip_url)
     text, pick_meta = _extract_mineru_text_from_zip(zip_bytes)
 
-    from app.rag.ingest_kb import _hard_gate, _sanitize_text
+    from app.rag.ingest_kb import _hard_gate, _sanitize_text, _semantic_chunk_text
 
     clean = _sanitize_text(text)
     if not _hard_gate(clean):
@@ -1387,28 +1389,42 @@ def ocr_status(
         }
 
     chunk_id = str(rec.get("chunk_id") or "").strip() or f"ocr:{task_id}:{_sha256_text(clean)[:8]}"
-    metadata = {
-        "source_file": src_name[:120],
-        "source": src_url[:240],
-        "page": None,
-        "section": "ocr",
-        "department": "",
-        "title": src_name[:120],
-        "row": None,
-        "domain": "ocr",
-        "chunk_id": chunk_id,
-        "source_kind": src_kind,
-        "session_id": sid,
-        "picked": pick_meta.get("picked"),
-    }
+    chunk_size = int(os.getenv("RAG_CHUNK_SIZE", "800") or "800")
+    chunk_overlap = int(os.getenv("RAG_CHUNK_OVERLAP", "100") or "100")
+    chunk_texts = _semantic_chunk_text(
+        clean,
+        target_tokens=max(1, chunk_size),
+        max_tokens=max(chunk_size, chunk_size + max(0, chunk_overlap)),
+        max_chars=max(4000, chunk_size),
+        overlap_tokens=max(0, chunk_overlap),
+    )
 
     vs = _get_vectordb_for_ocr()
-    try:
-        vs.add_texts([clean], metadatas=[metadata])
-    except Exception:
-        from langchain.schema import Document  # type: ignore
+    from langchain.schema import Document  # type: ignore
 
-        vs.add_documents([Document(page_content=clean, metadata=metadata)])
+    documents = []
+    for idx, chunk_text in enumerate(chunk_texts or [clean]):
+        documents.append(
+            Document(
+                page_content=chunk_text,
+                metadata={
+                    "source_file": src_name[:120],
+                    "source": src_url[:240],
+                    "page": None,
+                    "section": "ocr",
+                    "department": "",
+                    "title": src_name[:120],
+                    "row": None,
+                    "domain": "ocr",
+                    "chunk_id": f"{chunk_id}:{idx}",
+                    "source_kind": src_kind,
+                    "session_id": sid,
+                    "picked": pick_meta.get("picked"),
+                },
+            )
+        )
+
+    vs.add_documents(documents)
     if hasattr(vs, "persist"):
         try:
             vs.persist()

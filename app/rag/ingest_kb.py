@@ -27,6 +27,7 @@ from app.rag.utils.rag_shared import (
     resolve_kb_dir_strict,
     resolve_persist_dir,
 )
+from app.rag.faiss_store import FaissHNSWStore
 
 
 apply_windows_openmp_workaround()
@@ -129,6 +130,8 @@ def _append_bad_row(
 # -----------------------------
 _CTRL = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 _WHITESPACE = re.compile(r"[ \t\f\v]+")
+_SEMANTIC_SENTENCE_SPLIT = re.compile(r"(?<=[。！？!?；;])")
+_STRUCTURED_PREFIX_KEYS = ("科室：", "主题：", "患者问题：", "医生回答：")
 
 
 def _sanitize_text(s: str) -> str:
@@ -160,6 +163,177 @@ def _hard_gate(text: str) -> bool:
     if len(text.strip()) < 10:
         return False
     return True
+
+
+def _token_count_default(text: str) -> int:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return 0
+    try:
+        import tiktoken  # type: ignore
+    except Exception as e:
+        raise RuntimeError("缺少 tiktoken，无法执行 token 回退分块。") from e
+    enc = tiktoken.get_encoding("cl100k_base")
+    return len(enc.encode(cleaned))
+
+
+def _split_semantic_units(text: str) -> List[str]:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return []
+
+    paragraphs = [part.strip() for part in re.split(r"\n{2,}", cleaned) if part and part.strip()]
+    units: List[str] = []
+    for paragraph in paragraphs or [cleaned]:
+        lines = [line.strip() for line in paragraph.splitlines() if line and line.strip()]
+        if len(lines) > 1 and any(line.startswith(("科室：", "主题：", "患者问题：", "医生回答：")) for line in lines):
+            units.extend(lines)
+            continue
+        sentences = [part.strip() for part in _SEMANTIC_SENTENCE_SPLIT.split(paragraph) if part and part.strip()]
+        if sentences:
+            units.extend(sentences)
+        else:
+            units.append(paragraph)
+    return units
+
+
+def _join_chunk_parts(parts: List[str]) -> str:
+    if not parts:
+        return ""
+    if all("\n" not in part for part in parts):
+        joined = "".join(parts)
+    else:
+        joined = "\n".join(parts)
+    return joined.strip()
+
+
+def _split_structured_prefix(text: str) -> Tuple[str, str]:
+    lines = [line.rstrip() for line in str(text or "").splitlines() if line and line.strip()]
+    if len(lines) < 2:
+        return "", str(text or "").strip()
+    if not any(line.startswith(_STRUCTURED_PREFIX_KEYS[:-1]) for line in lines[:3]):
+        return "", str(text or "").strip()
+    if not lines[-1].startswith("医生回答："):
+        return "", str(text or "").strip()
+    prefix = "\n".join(lines[:-1]).strip()
+    body = lines[-1].strip()
+    return prefix, body
+
+
+def _token_backoff_split(
+    text: str,
+    *,
+    max_tokens: int,
+    max_chars: int,
+    overlap_tokens: int,
+    token_counter,
+) -> List[str]:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return []
+
+    if " " in cleaned:
+        atoms = [part for part in cleaned.split(" ") if part]
+        joiner = " "
+    else:
+        atoms = [ch for ch in cleaned if ch.strip()]
+        joiner = ""
+
+    if not atoms:
+        return [cleaned]
+
+    chunks: List[str] = []
+    start = 0
+    step_back = max(0, int(overlap_tokens))
+    while start < len(atoms):
+        end = start
+        best = ""
+        while end < len(atoms):
+            candidate = joiner.join(atoms[start : end + 1]).strip()
+            if not candidate:
+                end += 1
+                continue
+            if token_counter(candidate) > max_tokens or len(candidate) > max_chars:
+                break
+            best = candidate
+            end += 1
+
+        if not best:
+            best = joiner.join(atoms[start : start + 1]).strip()
+            end = start + 1
+
+        chunks.append(best)
+        if end >= len(atoms):
+            break
+        start = max(start + 1, end - step_back)
+    return chunks
+
+
+def _semantic_chunk_text(
+    text: str,
+    *,
+    target_tokens: int,
+    max_tokens: int,
+    max_chars: int,
+    overlap_tokens: int = 0,
+    token_counter=None,
+) -> List[str]:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return []
+
+    counter = token_counter or _token_count_default
+    if counter(cleaned) <= max_tokens and len(cleaned) <= max_chars:
+        return [cleaned]
+
+    prefix, body = _split_structured_prefix(cleaned)
+    body_clean = body.strip() if body.strip() else cleaned
+    units = _split_semantic_units(body_clean)
+    if not units:
+        units = [body_clean]
+
+    chunks: List[str] = []
+    current_parts: List[str] = []
+
+    def _emit_current() -> None:
+        if not current_parts:
+            return
+        joined = _join_chunk_parts(current_parts)
+        if prefix:
+            joined = f"{prefix}\n{joined}".strip()
+        chunks.append(joined)
+        current_parts.clear()
+
+    for unit in units:
+        candidate_parts = current_parts + [unit]
+        candidate_body = _join_chunk_parts(candidate_parts)
+        candidate_text = f"{prefix}\n{candidate_body}".strip() if prefix else candidate_body
+        if current_parts and counter(candidate_text) > target_tokens:
+            _emit_current()
+            candidate_parts = [unit]
+            candidate_body = _join_chunk_parts(candidate_parts)
+            candidate_text = f"{prefix}\n{candidate_body}".strip() if prefix else candidate_body
+
+        if counter(candidate_text) <= max_tokens and len(candidate_text) <= max_chars:
+            current_parts.extend(candidate_parts[len(current_parts) :])
+            continue
+
+        if current_parts:
+            _emit_current()
+
+        fallback_chunks = _token_backoff_split(
+            unit,
+            max_tokens=max_tokens,
+            max_chars=max_chars if not prefix else max(32, max_chars - len(prefix) - 1),
+            overlap_tokens=overlap_tokens,
+            token_counter=counter,
+        )
+        for fallback in fallback_chunks:
+            final_chunk = f"{prefix}\n{fallback}".strip() if prefix else fallback
+            chunks.append(final_chunk)
+
+    _emit_current()
+    return [chunk for chunk in chunks if chunk]
 
 
 def _read_text_file(path: Path) -> str:
@@ -622,13 +796,11 @@ def build_and_persist_store(
     chunk_overlap: int = 100,
     embedding_model_name: Optional[str] = None,
 ) -> int:
-    """Ingest kb_docs into a persistent Chroma store. Returns number of chunks ingested."""
+    """Ingest kb_docs into a persistent Faiss-HNSW store. Returns number of chunks ingested."""
     try:
-        from langchain.text_splitter import RecursiveCharacterTextSplitter  # type: ignore
-        from langchain.vectorstores import Chroma  # type: ignore
         from langchain.schema import Document  # type: ignore
     except Exception as e:
-        raise RuntimeError("缺少 langchain/chroma 相关依赖，无法构建向量库。") from e
+        raise RuntimeError("缺少 langchain 相关依赖，无法构建入库文档对象。") from e
 
     # 强制“数据隔离”：只允许入库合并CSV目录（或其子目录）
     # 仍保留：RAG_INGEST_TXT=1 时可入库 txt（但在本工程默认目录里不会有总结/评测文件）
@@ -642,12 +814,6 @@ def build_and_persist_store(
         f"kb_dir={kb_dir} persist_dir={persist_dir} collection={collection_name}",
         flush=True,
     )
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", " ", ""],
-    )
-
     do_reset = env_flag("RAG_RESET", "0")
     if do_reset:
         try:
@@ -657,10 +823,10 @@ def build_and_persist_store(
 
     persist_dir.mkdir(parents=True, exist_ok=True)
 
-    vectordb = Chroma(
-        collection_name=collection_name,
+    vectordb = FaissHNSWStore(
+        persist_dir=persist_dir,
         embedding_function=embeddings,
-        persist_directory=str(persist_dir),
+        collection_name=collection_name,
     )
 
     # 默认只入库 CSV：只扫描 kb_dir 下的 *.csv
@@ -730,7 +896,7 @@ def build_and_persist_store(
     batches_written = 0
 
     try:
-        count0 = vectordb._collection.count()  # type: ignore[attr-defined]
+        count0 = vectordb.count()
     except Exception:
         count0 = None
 
@@ -841,7 +1007,13 @@ def build_and_persist_store(
             if (not split_csv) and len(text) <= csv_soft_limit:
                 chunks = [text]
             else:
-                chunks = splitter.split_text(text)
+                chunks = _semantic_chunk_text(
+                    text,
+                    target_tokens=max(1, int(chunk_size)),
+                    max_tokens=max(int(chunk_size), int(chunk_size) + max(0, int(chunk_overlap))),
+                    max_chars=max(int(csv_soft_limit), int(chunk_size)),
+                    overlap_tokens=max(0, int(chunk_overlap)),
+                )
 
             for local_idx, chunk in enumerate(chunks):
                 chunk_counter += 1
@@ -849,7 +1021,7 @@ def build_and_persist_store(
                 md["department_group"] = dept
                 md["source_path"] = key
                 md["chunk_id"] = f"{rd.metadata.get('source','')}:{rd.metadata.get('row','')}:{local_idx}"
-                # 强制保证写入Chroma的是 Python str（不是 bytes）
+                # 强制保证写入索引的是 Python str（不是 bytes）
                 batch.append(Document(page_content=str(chunk), metadata=md))
 
                 if len(batch) >= batch_size:
@@ -883,7 +1055,7 @@ def build_and_persist_store(
 
     vectordb.persist()
     try:
-        count1 = vectordb._collection.count()  # type: ignore[attr-defined]
+        count1 = vectordb.count()
     except Exception:
         count1 = None
 

@@ -9,11 +9,11 @@ M2：AgentOrchestration（LangGraph 多轮可追问问诊编排）。
 - N3 TriagePlanner：判断缺口 -> Ask 或 Answer
 - N4 RAGRetrieve：调用 M1 的 RAG（进程内）
 - N5 AnswerCompose：调用 LLM 生成带引用的回答
-- N6 PersistState：写入本地存储（SQLite）
+- N6 PersistState：写入 Redis 会话存储
 
 重要约束：
 - 不在日志中输出完整用户文本，最多前 100 字符或 hash。
-- LLM 不可用时必须能降级：使用规则抽取 + 模板回答。
+- 主链路必须保持单一路径执行，不做运行时降级或兼容回退。
 """
 
 from __future__ import annotations
@@ -38,14 +38,35 @@ from app.agent.prompts import (
     SLOT_EXTRACTION_SYSTEM,
     SLOT_EXTRACTION_USER_TEMPLATE,
 )
-from app.agent.state import AgentSessionState, Slots, build_summary_from_slots
-from app.agent.storage_sqlite import SqliteSessionStore
+from app.agent.record_index import build_record_summary_from_records, upsert_longitudinal_records
+from app.agent.storage import SessionStore, build_session_store
+from app.agent.state import AgentSessionState, Slots, build_chief_complaint_from_slots, build_summary_from_slots
+from app.privacy import redact_pii_for_llm
+from app.rag.evidence_policy import is_low_evidence, summarize_evidence_quality
+from app.safety.conflict_judge import judge_text_conflicts
+from app.safety.record_guard import (
+    apply_record_conflicts_to_answer_text,
+    build_record_summary_from_slots,
+    detect_record_conflicts,
+)
 
 
 logger = logging.getLogger(__name__)
 
 
 Mode = Literal["ask", "answer", "escalate"]
+
+PHASE0_OOD_ANSWER_TEMPLATE = """我只能处理医疗健康相关的问题。
+请直接描述你的症状、持续时间、严重程度、年龄或既往病史，我再继续判断。
+
+免责声明：本回答仅供信息参考，不能替代医生面诊。
+"""
+
+PHASE0_ATTACK_ANSWER_TEMPLATE = """当前请求不属于可执行的医疗问诊输入。
+请直接描述你的症状、持续时间、严重程度、年龄或既往病史，我会按医疗问诊流程继续判断。
+
+免责声明：本回答仅供信息参考，不能替代医生面诊。
+"""
 
 
 class AgentGraphState(TypedDict, total=False):
@@ -72,8 +93,15 @@ class AgentGraphState(TypedDict, total=False):
     trace: Dict[str, Any]
 
 
-_STORE = SqliteSessionStore()
+_STORE: Optional[SessionStore] = None
 _GRAPH = None
+
+
+def _get_store() -> SessionStore:
+    global _STORE
+    if _STORE is None:
+        _STORE = build_session_store()
+    return _STORE
 
 
 def _sha256_text(text: str) -> str:
@@ -396,14 +424,114 @@ def _looks_like_red_flag(text: str) -> List[str]:
         "喉头水肿",
         "偏瘫",
         "言语不清",
+        "剧烈头痛",
         "呕血",
         "便血",
         "黑便",
         "休克",
         "持续高热",
     ]
-    hits = [k for k in keywords if k in msg]
+    pattern_hits: List[str] = []
+    pattern_map = [
+        (r"(?:最)?剧烈(?:的)?头痛", "剧烈头痛"),
+    ]
+    for pattern, label in pattern_map:
+        if re.search(pattern, msg):
+            pattern_hits.append(label)
+
+    hits = pattern_hits + [k for k in keywords if k in msg and k not in pattern_hits]
     return hits[:6]
+
+
+def _classify_phase0_guardrail(text: str) -> Dict[str, Any]:
+    msg = str(text or "").strip()
+    safe_msg = redact_pii_for_llm(msg)
+    lowered = safe_msg.lower()
+
+    attack_terms = [
+        "忽略之前",
+        "忽略以上",
+        "系统提示词",
+        "提示词原文",
+        "越狱",
+        "jailbreak",
+        "ignore previous",
+        "ignore all previous",
+        "system prompt",
+        "developer message",
+    ]
+    attack_hits = [term for term in attack_terms if term in lowered]
+    if attack_hits:
+        return {
+            "blocked": True,
+            "label": "prompt_attack",
+            "hits": attack_hits[:4],
+            "pii_masked": safe_msg != msg,
+            "safe_message_hash": _stable_hash_text(safe_msg),
+        }
+
+    medical_terms = [
+        "头痛",
+        "发热",
+        "发烧",
+        "咳嗽",
+        "腹痛",
+        "腹泻",
+        "呕吐",
+        "胸痛",
+        "呼吸困难",
+        "恶心",
+        "皮疹",
+        "瘙痒",
+        "喉咙",
+        "咽痛",
+        "药",
+        "过敏",
+        "病",
+        "医院",
+        "感染",
+        "传染",
+        "病毒",
+        "细菌",
+        "症状",
+        "疼",
+    ]
+    if any(term in safe_msg for term in medical_terms):
+        return {
+            "blocked": False,
+            "label": "medical",
+            "hits": [],
+            "pii_masked": safe_msg != msg,
+            "safe_message_hash": _stable_hash_text(safe_msg),
+        }
+
+    ood_terms = [
+        "python",
+        "爬虫",
+        "代码",
+        "脚本",
+        "sql",
+        "论文",
+        "股票",
+        "基金",
+        "天气",
+        "翻译",
+        "简历",
+        "作文",
+        "八卦",
+        "明星",
+        "旅游",
+        "游戏",
+    ]
+    ood_hits = [term for term in ood_terms if term in lowered]
+    blocked = bool(ood_hits)
+    return {
+        "blocked": blocked,
+        "label": "out_of_domain" if blocked else "medical",
+        "hits": ood_hits[:4],
+        "pii_masked": safe_msg != msg,
+        "safe_message_hash": _stable_hash_text(safe_msg),
+    }
 
 
 def _guess_department(slots: Slots, user_message: str) -> Optional[str]:
@@ -480,7 +608,7 @@ def _normalize_department(dept: Optional[str]) -> Optional[str]:
 
 
 def _rule_extract_slots(user_message: str) -> Slots:
-    """LLM 失败时的规则兜底抽取。"""
+    """规则槽位抽取实现，仅供测试替身或离线打桩使用。"""
 
     msg = (user_message or "").strip()
     out = Slots()
@@ -546,14 +674,29 @@ def _rule_extract_slots(user_message: str) -> Slots:
             break
 
     # 时长
-    m2 = re.search(r"([0-9一二三四五六七八九十]+)\s*(分钟|小时|天|周|个月|月|年)", msg)
+    m2 = re.search(r"([0-9一二三四五六七八九十两半]+)\s*(分钟|小时|天|周|个月|月|年)", msg)
     if m2:
         out.duration = f"{m2.group(1)}{m2.group(2)}"
 
     # 严重程度
-    m3 = re.search(r"\b(10|[0-9])\s*/\s*10\b", msg)
+    m3 = re.search(r"(?<!\d)(10|[0-9])\s*/\s*10(?!\d)", msg)
     if m3:
         out.severity = f"{m3.group(1)}/10"
+
+    # 过敏史
+    m4 = re.search(r"([^\s，。；;、]{1,20}过敏)", msg)
+    if m4:
+        out.allergy = m4.group(1)
+
+    # 既往史 / 基础病
+    m5 = re.search(r"(?:既往有|有)([^\s，。；;、]{1,20}(?:史|病史))", msg)
+    if m5:
+        out.history = m5.group(1)
+
+    # 用药
+    m6 = re.search(r"(?:正在|目前在|现在在|一直在)(?:吃|用)([^\s，。；;、]{1,20})", msg)
+    if m6:
+        out.meds = m6.group(1)
 
     # 红旗
     out.red_flags = _looks_like_red_flag(msg)
@@ -567,8 +710,7 @@ def _rule_extract_slots(user_message: str) -> Slots:
 def _call_llm_text(system: str, user: str) -> str:
     """统一的 LLM 调用封装（DeepSeek/OpenAI 兼容）。
 
-    注意：
-    - 该函数可能抛异常；上层必须捕获并降级。
+    注意：该函数失败时直接抛异常，由主链路 fail-fast。
     """
 
     try:
@@ -606,9 +748,10 @@ def _call_llm_json(system: str, user: str) -> Dict[str, Any]:
 
 
 def _extract_slots_with_llm(user_message: str) -> Slots:
+    safe_user_message = redact_pii_for_llm((user_message or "").strip())
     raw = _call_llm_json(
         SLOT_EXTRACTION_SYSTEM,
-        SLOT_EXTRACTION_USER_TEMPLATE.format(user_message=(user_message or "").strip()),
+        SLOT_EXTRACTION_USER_TEMPLATE.format(user_message=safe_user_message),
     )
     try:
         # 允许缺字段；Pydantic 会自动填默认
@@ -718,6 +861,25 @@ def _citations_from_evidence(evidence: List[Dict[str, Any]]) -> List[Dict[str, A
     return out
 
 
+def _build_low_evidence_answer(evidence: List[Dict[str, Any]]) -> str:
+    if evidence:
+        body = (
+            "当前仅检索到少量本地资料，证据不足以支持明确判断。\n"
+            "建议：\n"
+            "- 先补充症状持续时间、严重程度、伴随症状以及既往病史；\n"
+            "- 若方便，也请补充年龄、正在使用的药物和过敏情况；\n"
+            "- 如果出现胸痛、呼吸困难、意识改变等危险信号，请尽快线下就医。"
+        )
+    else:
+        body = (
+            "目前未检索到可靠的本地资料支持你的问题。\n"
+            "建议：\n"
+            "- 若症状轻微：注意休息、补液、观察变化；\n"
+            "- 若症状持续加重、出现胸痛、呼吸困难或意识改变等危险信号，请尽快就医。"
+        )
+    return _ensure_answer_contract(body, evidence)
+
+
 def _ensure_answer_contract(answer: str, evidence: List[Dict[str, Any]]) -> str:
     """确保回答满足契约：引用与免责声明。
 
@@ -768,6 +930,38 @@ def _node_safety_gate(state: AgentGraphState) -> Dict[str, Any]:
 
     msg = str(state.get("user_message") or "").strip()
 
+    phase0 = _classify_phase0_guardrail(msg)
+    tr = state.get("trace") if isinstance(state.get("trace"), dict) else {}
+    tr["phase0_guardrail"] = phase0
+    state["trace"] = cast(Dict[str, Any], tr)
+
+    if bool(phase0.get("blocked")):
+        answer = (
+            PHASE0_ATTACK_ANSWER_TEMPLATE
+            if str(phase0.get("label") or "").strip() == "prompt_attack"
+            else PHASE0_OOD_ANSWER_TEMPLATE
+        ).strip()
+        safe_msg = redact_pii_for_llm(msg)
+        if safe_msg:
+            sess.append_message("user", safe_msg)
+        sess.append_message("assistant", answer)
+        state["mode"] = "answer"
+        state["answer"] = answer
+        state["ask_text"] = ""
+        state["questions"] = []
+        state["next_questions"] = []
+        state["citations"] = []
+        _trace_end(state, node, t0)
+        return {
+            "session": sess,
+            "mode": state.get("mode"),
+            "answer": state.get("answer"),
+            "ask_text": state.get("ask_text"),
+            "questions": state.get("questions"),
+            "next_questions": state.get("next_questions"),
+            "citations": state.get("citations"),
+        }
+
     hits = _looks_like_red_flag(msg)
 
     # 记录 safety_flags 到 trace
@@ -810,23 +1004,12 @@ def _node_memory_update(state: AgentGraphState) -> Dict[str, Any]:
     msg = str(state.get("user_message") or "").strip()
 
     # 记录用户消息
-    sess.append_message("user", msg)
+    sess.append_message("user", redact_pii_for_llm(msg))
 
     # ===== 批次1新增：记录更新前的槽位 =====
     old_slots = sess.slots.model_dump()
 
-    # 抽取策略：优先 LLM，失败则规则兜底；支持强制 rules（用于离线自测/CI）
-    patch_slots: Slots
-    forced = str(os.getenv("AGENT_SLOT_EXTRACTOR", "auto")).strip().lower()
-    if forced == "rules":
-        patch_slots = _rule_extract_slots(msg)
-    else:
-        try:
-            patch_slots = _extract_slots_with_llm(msg)
-        except Exception as e:
-            if _env_flag("RAG_DEBUG", "0"):
-                logger.warning("[Agent] 槽位抽取降级为规则：%s", str(e))
-            patch_slots = _rule_extract_slots(msg)
+    patch_slots = _extract_slots_with_llm(msg)
 
     sess.slots = sess.slots.merge_from_partial(patch_slots)
 
@@ -839,6 +1022,11 @@ def _node_memory_update(state: AgentGraphState) -> Dict[str, Any]:
 
     # summary 用规则稳定构建
     sess.summary = build_summary_from_slots(sess.slots)
+    sess.longitudinal_records, record_admission = upsert_longitudinal_records(
+        sess.longitudinal_records,
+        patch_slots,
+    )
+    sess.record_summary = build_record_summary_from_records(sess.longitudinal_records)
 
     # ===== 批次1新增：记录槽位变化到 trace =====
     new_slots = sess.slots.model_dump()
@@ -848,6 +1036,8 @@ def _node_memory_update(state: AgentGraphState) -> Dict[str, Any]:
     if not isinstance(tr, dict):
         tr = {}
     tr["slots_changed"] = slots_changed
+    tr["record_admission"] = dict(record_admission)
+    tr["record_admission"]["total_records"] = len(sess.longitudinal_records)
     state["trace"] = cast(Dict[str, Any], tr)
 
     _trace_end(state, node, t0)
@@ -945,51 +1135,65 @@ def _node_rag_retrieve(state: AgentGraphState) -> Dict[str, Any]:
     top_n = int(state.get("top_n") or 30)
     use_rerank = bool(state.get("use_rerank") if state.get("use_rerank") is not None else True)
 
-    rag_query = (sess.summary + "；问题：" + msg).strip("； ")
+    tr_any = state.get("trace")
+    tr: Dict[str, Any] = tr_any if isinstance(tr_any, dict) else {}
+    planner_strategy = str(tr.get("planner_strategy") or "").strip()
+
+    chief_complaint = build_chief_complaint_from_slots(sess.slots)
+    if chief_complaint:
+        tr["chief_complaint"] = chief_complaint
+
+    if planner_strategy == "kb_qa":
+        rag_query_parts = [f"问题：{msg}"]
+    else:
+        structured_query = f"主诉：{chief_complaint}" if chief_complaint else str(sess.summary or "").strip()
+        rag_query_parts = [str(sess.record_summary or "").strip(), structured_query]
+    rag_query = "；".join([part for part in rag_query_parts if part]).strip("； ")
 
     dept = sess.slots.department_guess
 
     # 调用 M1：必须走兼容层 app.rag.retriever.retrieve
-    evidence: List[Dict[str, Any]]
-    try:
-        from app.rag.retriever import retrieve as rag_retrieve  # type: ignore
-        from app.rag.rag_core import get_stats  # type: ignore
+    from app.rag.retriever import get_last_retrieval_meta as rag_get_last_retrieval_meta  # type: ignore
+    from app.rag.retriever import retrieve as rag_retrieve  # type: ignore
+    from app.rag.rag_core import get_stats  # type: ignore
 
-        rag_t0 = _now_ms()
-        evidence = cast(
-            List[Dict[str, Any]],
-            rag_retrieve(
+    rag_t0 = _now_ms()
+    evidence = cast(
+        List[Dict[str, Any]],
+        rag_retrieve(
             rag_query,
             top_k=top_k,
             top_n=top_n,
             department=dept,
             use_rerank=use_rerank,
-            ),
-        )
-        rag_latency_ms = int((_now_ms() - rag_t0) * 1000)
+        ),
+    )
+    rag_latency_ms = int((_now_ms() - rag_t0) * 1000)
+    rag_meta = rag_get_last_retrieval_meta()
 
-        st = get_stats()
-        tr_any = state.get("trace")
-        tr: Dict[str, Any] = tr_any if isinstance(tr_any, dict) else {}
-        tr["rag_stats"] = {
-            "device": st.device,
-            "collection": st.collection,
-            "count": st.count,
-            "hits": len(evidence or []),
-            "latency_ms": rag_latency_ms,
-        }
-        state["trace"] = cast(Dict[str, Any], tr)
-
-    except Exception as e:
-        # RAG 失败不能直接崩：退化为无证据回答
-        if _env_flag("RAG_DEBUG", "0"):
-            logger.warning("[Agent] RAG 检索失败：%s", str(e))
-        evidence = []
-        tr_any2 = state.get("trace")
-        tr = tr_any2 if isinstance(tr_any2, dict) else {}
-        tr["rag_stats"] = {"hits": 0, "latency_ms": 0}
-        tr["rag_error"] = f"{type(e).__name__}: {e}"
-        state["trace"] = cast(Dict[str, Any], tr)
+    st = get_stats()
+    tr["rag_stats"] = {
+        "backend": getattr(st, "backend", "faiss-hnsw"),
+        "device": st.device,
+        "collection": st.collection,
+        "count": st.count,
+        "hits": len(evidence or []),
+        "latency_ms": rag_latency_ms,
+        "evidence_quality": summarize_evidence_quality(evidence),
+    }
+    if isinstance(rag_meta, dict):
+        for key in (
+            "cache_hit",
+            "cache_mode",
+            "cache_backend",
+            "hybrid_enabled",
+            "search_query",
+            "dense_hits",
+            "sparse_hits",
+        ):
+            if key in rag_meta:
+                tr["rag_stats"][key] = rag_meta.get(key)
+    state["trace"] = cast(Dict[str, Any], tr)
 
     _trace_end(state, node, t0)
     return {"evidence": evidence}
@@ -1029,50 +1233,60 @@ def _node_answer_compose(state: AgentGraphState) -> Dict[str, Any]:
     # answer 模式
     evidence = cast(List[Dict[str, Any]], state.get("evidence") if isinstance(state.get("evidence"), list) else [])
     evidence_block = _format_evidence_for_llm(evidence)
+    rag_stats = state.get("trace") if isinstance(state.get("trace"), dict) else {}
+    evidence_quality = {}
+    if isinstance(rag_stats, dict):
+        tmp = rag_stats.get("rag_stats")
+        if isinstance(tmp, dict) and isinstance(tmp.get("evidence_quality"), dict):
+            evidence_quality = cast(Dict[str, Any], tmp.get("evidence_quality"))
+    if not evidence_quality:
+        evidence_quality = summarize_evidence_quality(evidence)
 
-    if not evidence:
-        # 无证据：不强行调用 LLM（减少不确定性与成本）
-        ans = (
-            "目前未检索到可靠的本地资料支持你的问题。\n"
-            "建议：\n"
-            "- 若症状轻微：注意休息、补液、观察变化；\n"
-            "- 若症状持续加重、出现胸痛/呼吸困难/意识改变等危险信号，请尽快就医。\n\n"
-            "引用：[]\n"
-            "免责声明：本回答仅供信息参考，不能替代医生面诊。"
-        )
-        ans = _ensure_answer_contract(ans, [])
+    if is_low_evidence(evidence_quality):
+        ans = _build_low_evidence_answer(evidence)
+        conflicts = detect_record_conflicts(ans, sess.record_summary or build_record_summary_from_slots(sess.slots))
+        confirmed_conflicts, dismissed_conflicts = judge_text_conflicts(ans, conflicts)
+        if confirmed_conflicts:
+            ans = apply_record_conflicts_to_answer_text(ans, confirmed_conflicts)
+            ans = _ensure_answer_contract(ans, evidence)
+        tr_any = state.get("trace")
+        tr = tr_any if isinstance(tr_any, dict) else {}
+        tr["record_conflicts"] = confirmed_conflicts
+        if dismissed_conflicts:
+            tr["record_conflicts_dismissed"] = dismissed_conflicts
+        state["trace"] = cast(Dict[str, Any], tr)
         sess.append_message("assistant", ans)
-        state["citations"] = []
+        state["citations"] = _citations_from_evidence(evidence)
         _trace_end(state, node, t0)
-        return {"answer": ans, "citations": []}
+        return {"answer": ans, "citations": state["citations"]}
 
     # 有证据：调用 LLM 生成回答
     user_msg = str(state.get("user_message") or "").strip()
     summary = sess.summary
 
-    try:
-        user_prompt = ANSWER_USER_TEMPLATE.format(
-            user_message=user_msg,
-            summary=summary or "(无)",
-            evidence_block=evidence_block or "(无)",
-        )
-        text = _call_llm_text(ANSWER_SYSTEM, user_prompt)
-        ans = (text or "").strip()
-    except Exception as e:
-        if _env_flag("RAG_DEBUG", "0"):
-            logger.warning("[Agent] LLM 回答失败，退化为模板：%s", str(e))
-        ans = (
-            "我根据检索到的资料做了初步整理：\n"
-            "- 你可以先关注：症状变化、是否出现持续高热/呼吸困难等危险信号。\n"
-            "- 若症状持续或加重，建议尽快线下就医。\n\n"
-            "引用：[E1]\n"
-            "免责声明：本回答仅供信息参考，不能替代医生面诊。"
-        )
+    user_prompt = ANSWER_USER_TEMPLATE.format(
+        user_message=redact_pii_for_llm(user_msg),
+        summary=summary or "(无)",
+        evidence_block=evidence_block or "(无)",
+    )
+    text = _call_llm_text(ANSWER_SYSTEM, user_prompt)
+    ans = (text or "").strip()
+
+    conflicts = detect_record_conflicts(ans, sess.record_summary or build_record_summary_from_slots(sess.slots))
+    confirmed_conflicts, dismissed_conflicts = judge_text_conflicts(ans, conflicts)
+    if confirmed_conflicts:
+        ans = apply_record_conflicts_to_answer_text(ans, confirmed_conflicts)
 
     citations = _citations_from_evidence(evidence)
     ans = _ensure_answer_contract(ans, evidence)
     sess.append_message("assistant", ans)
     state["citations"] = citations
+    tr_any = state.get("trace")
+    tr = tr_any if isinstance(tr_any, dict) else {}
+    tr["record_conflicts"] = confirmed_conflicts
+    if dismissed_conflicts:
+        tr["record_conflicts_dismissed"] = dismissed_conflicts
+    state["trace"] = cast(Dict[str, Any], tr)
 
     _trace_end(state, node, t0)
     return {"answer": ans, "citations": citations}
@@ -1087,10 +1301,11 @@ def _node_persist_state(state: AgentGraphState) -> Dict[str, Any]:
         raise RuntimeError("PersistState: session 缺失")
 
     try:
-        _STORE.save_session(sess)
+        store = _get_store()
+        store.save_session(sess)
         tr_any3 = state.get("trace")
         tr: Dict[str, Any] = tr_any3 if isinstance(tr_any3, dict) else {}
-        tr["storage"] = {"type": "sqlite", "db_path": _STORE.db_path}
+        tr["storage"] = store.storage_meta()
         state["trace"] = cast(Dict[str, Any], tr)
     except Exception as e:
         raise RuntimeError(f"会话持久化失败：{type(e).__name__}: {e}") from e
@@ -1100,6 +1315,11 @@ def _node_persist_state(state: AgentGraphState) -> Dict[str, Any]:
 
 
 def _route_after_safety(state: AgentGraphState) -> str:
+    tr = state.get("trace")
+    if isinstance(tr, dict):
+        phase0 = tr.get("phase0_guardrail")
+        if isinstance(phase0, dict) and bool(phase0.get("blocked")):
+            return "persist"
     if state.get("mode") == "escalate":
         return "persist"
     return "memory"
@@ -1156,7 +1376,7 @@ def load_or_create_session(session_id: Optional[str] = None) -> AgentSessionStat
     if not sid:
         sid = str(uuid4())
 
-    st = _STORE.load_session(sid)
+    st = _get_store().load_session(sid)
     if st is not None:
         return st
 

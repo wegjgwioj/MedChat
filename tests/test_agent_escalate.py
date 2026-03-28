@@ -134,6 +134,34 @@ def test_non_red_flag_not_escalate(monkeypatch):
     assert len(hits) == 0
 
 
+def test_worst_headache_triggers_red_flag(monkeypatch):
+    """测试最剧烈头痛命中红旗"""
+    monkeypatch.setenv("AGENT_SLOT_EXTRACTOR", "rules")
+
+    from app.agent.graph import _looks_like_red_flag
+
+    hits = _looks_like_red_flag("这是我经历过最剧烈的头痛")
+    assert any("剧烈头痛" in h or "最剧烈头痛" in h for h in hits)
+
+
+def test_worst_headache_with_vomiting_escalates(monkeypatch):
+    """测试最剧烈头痛伴持续呕吐触发 escalate"""
+    monkeypatch.setenv("AGENT_SLOT_EXTRACTOR", "rules")
+
+    from app.api_server import app
+
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/agent/chat_v2",
+        json={"user_message": "这是我经历过最剧烈的头痛，而且一直在呕吐"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body.get("mode") == "escalate"
+
+
 def test_empty_message_no_red_flag(monkeypatch):
     """测试空消息不触发红旗"""
     monkeypatch.setenv("AGENT_SLOT_EXTRACTOR", "rules")

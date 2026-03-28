@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import EvidencePanel from '../components/EvidencePanel'
 import FollowUpPanel from '../components/FollowUpPanel'
 import DebugTrace from '../components/DebugTrace'
-import { chatV2 } from '../lib/api'
+import { chatV2, chatV2Stream, ocrIngest, ocrStatus } from '../lib/api'
 import type { AgentChatV2Mode, AgentChatV2Response } from '../types/agent'
 
 type Role = 'user' | 'assistant'
@@ -133,6 +133,7 @@ export default function Chat() {
   const [messages, setMessages] = useState<UiMessage[]>([])
   const [input, setInput] = useState('')
   const [isSending, setIsSending] = useState(false)
+  const [streamPhase, setStreamPhase] = useState('')
 
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [topK, setTopK] = useState(5)
@@ -140,6 +141,10 @@ export default function Chat() {
   const [useRerank, setUseRerank] = useState(true)
 
   const [debugEnabled, setDebugEnabled] = useState(false)
+  const [ocrUrl, setOcrUrl] = useState('')
+  const [ocrFile, setOcrFile] = useState<File | null>(null)
+  const [ocrStatusText, setOcrStatusText] = useState('')
+  const [ocrPolling, setOcrPolling] = useState(false)
 
   const bottomRef = useRef<HTMLDivElement | null>(null)
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
@@ -272,7 +277,25 @@ export default function Chat() {
         use_rerank: !!useRerank,
       }
 
-      const data = await chatV2(payload, { signal: ac.signal })
+      let data: AgentChatV2Response
+      try {
+        data = await chatV2Stream(
+          payload,
+          {
+            onAck: () => setStreamPhase('acknowledged'),
+            onStage: (stage) => setStreamPhase(stage.phase ?? 'running'),
+          },
+          { signal: ac.signal },
+        )
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        if (msg === 'STREAM_UNAVAILABLE') {
+          data = await chatV2(payload, { signal: ac.signal })
+        } else {
+          throw err
+        }
+      }
+
       updateSessionId(data.session_id)
 
       const nextQuestions = normalizeNonEmptyQuestions(data.next_questions)
@@ -317,6 +340,7 @@ export default function Chat() {
         isError: true,
       })
     } finally {
+      setStreamPhase('')
       setIsSending(false)
       inFlightRef.current = null
     }
@@ -324,6 +348,57 @@ export default function Chat() {
 
   function onSendFollowUpAnswer(answerText: string) {
     void sendText(answerText)
+  }
+
+  async function startOcrFromUrl() {
+    const url = ocrUrl.trim()
+    if (!url || ocrPolling) return
+    setOcrStatusText('创建 URL 解析任务中...')
+    try {
+      const resp = await ocrIngest({ session_id: sessionId || undefined, file_url: url })
+      if (resp.session_id) updateSessionId(resp.session_id)
+      setOcrStatusText(`任务已创建：${resp.task_id}`)
+      void pollOcrStatus(resp.task_id, resp.session_id, resp.source_url)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setOcrStatusText(`创建失败：${msg}`)
+    }
+  }
+
+  async function startOcrFromFile() {
+    if (!ocrFile || ocrPolling) return
+    setOcrStatusText(`上传并创建任务中：${ocrFile.name}`)
+    try {
+      const resp = await ocrIngest({ session_id: sessionId || undefined, file: ocrFile })
+      if (resp.session_id) updateSessionId(resp.session_id)
+      setOcrStatusText(`任务已创建：${resp.task_id}`)
+      void pollOcrStatus(resp.task_id, resp.session_id, resp.source_url)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setOcrStatusText(`创建失败：${msg}`)
+    }
+  }
+
+  async function pollOcrStatus(taskId: string, sid?: string, sourceUrl?: string) {
+    if (!taskId || ocrPolling) return
+    setOcrPolling(true)
+    try {
+      for (let i = 0; i < 60; i += 1) {
+        const st = await ocrStatus(taskId, { sessionId: sid || sessionId || undefined, sourceUrl })
+        if (st.done) {
+          setOcrStatusText(st.ingested ? '已完成并入库' : `已完成：${st.message ?? '未入库'}`)
+          return
+        }
+        setOcrStatusText(`处理中：${st.status || 'pending'}...`)
+        await new Promise((resolve) => setTimeout(resolve, 2000))
+      }
+      setOcrStatusText('处理中：超时，请稍后重试')
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setOcrStatusText(`查询失败：${msg}`)
+    } finally {
+      setOcrPolling(false)
+    }
   }
 
   return (
@@ -370,6 +445,39 @@ export default function Chat() {
                 </button>
                 <div className="placeholder" style={{ marginTop: 8 }}>
                   清空会话会移除本地 session_id，并清空当前消息列表。
+                </div>
+              </div>
+
+              <div className="card">
+                <div className="cardTitle">OCR 解析</div>
+                <input
+                  className="advInput"
+                  type="text"
+                  placeholder="粘贴可访问的文件 URL"
+                  value={ocrUrl}
+                  onChange={(e) => setOcrUrl(e.target.value)}
+                  disabled={ocrPolling}
+                />
+                <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
+                  <button className="newBtn" onClick={() => void startOcrFromUrl()} disabled={ocrPolling || !ocrUrl.trim()}>
+                    {ocrPolling ? '处理中...' : '解析 URL'}
+                  </button>
+                </div>
+                <div style={{ marginTop: 10 }}>
+                  <input
+                    className="advInput"
+                    type="file"
+                    onChange={(e) => setOcrFile(e.target.files?.[0] ?? null)}
+                    disabled={ocrPolling}
+                  />
+                </div>
+                <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
+                  <button className="newBtn" onClick={() => void startOcrFromFile()} disabled={ocrPolling || !ocrFile}>
+                    {ocrPolling ? '处理中...' : '上传文件'}
+                  </button>
+                </div>
+                <div className="placeholder" style={{ marginTop: 8 }}>
+                  {ocrStatusText || '支持 URL 解析和本地文件上传。解析完成后自动入库。'}
                 </div>
               </div>
 
@@ -492,6 +600,11 @@ export default function Chat() {
               <button className="sendBtn" onClick={() => void sendText(input)} disabled={isSending || !input.trim()}>
                 {isSending ? '发送中…' : '发送'}
               </button>
+              {streamPhase ? (
+                <div className="streamHint" style={{ marginTop: 4, fontSize: 12, color: '#888' }}>
+                  Stream ◦ {streamPhase}
+                </div>
+              ) : null}
             </div>
 
             {latestAssistant?.mode === 'ask' && ((latestAssistant?.questions?.length ?? 0) > 0 || (latestAssistant?.nextQuestions?.length ?? 0) > 0) ? (

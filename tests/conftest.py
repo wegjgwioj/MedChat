@@ -1,6 +1,7 @@
 import os
 import sys
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import pytest
 
@@ -42,4 +43,110 @@ def monkeypatch_session():
     mp = MonkeyPatch()
     yield mp
     mp.undo()
+
+
+class _FakeRedisClient:
+    def __init__(self):
+        self._data = {}
+
+    def ping(self):
+        return True
+
+    def get(self, key):
+        return self._data.get(key)
+
+    def set(self, key, value):
+        self._data[key] = value
+        return True
+
+    def delete(self, key):
+        self._data.pop(key, None)
+        return 1
+
+
+@pytest.fixture(autouse=True)
+def fake_agent_session_redis(monkeypatch):
+    monkeypatch.setenv("AGENT_REDIS_URL", "redis://pytest-session-store/0")
+
+    try:
+        from app.agent.storage_redis import RedisSessionStore
+    except Exception:
+        yield
+        return
+
+    monkeypatch.setattr(
+        RedisSessionStore,
+        "_create_client",
+        staticmethod(lambda _redis_url: _FakeRedisClient()),
+    )
+
+    try:
+        from app.rag.cache_redis import RedisSemanticCache
+
+        monkeypatch.setattr(
+            RedisSemanticCache,
+            "_create_client",
+            staticmethod(lambda _redis_url: _FakeRedisClient()),
+        )
+    except Exception:
+        pass
+
+    try:
+        import app.agent.graph as graph
+
+        monkeypatch.setattr(graph, "_STORE", None, raising=False)
+        monkeypatch.setattr(graph, "_GRAPH", None, raising=False)
+    except Exception:
+        pass
+
+    try:
+        import app.rag.rag_core as rag_core
+
+        rag_core.clear_runtime_state()
+    except Exception:
+        pass
+
+    yield
+
+
+class FakeRagStore:
+    def __init__(self, rows: Optional[List[Dict[str, Any]]] = None, count: Optional[int] = None):
+        self._rows = list(rows or [])
+        self._count = int(count) if count is not None else len(self._rows)
+        self.backend_name = "faiss-hnsw"
+        self.collection_name = "pytest_kb"
+        self.persist_dir = "pytest"
+
+    def count(self) -> int:
+        return self._count
+
+    def similarity_search_with_score(self, query: str, *, k: int, filter: Optional[Dict[str, Any]] = None):
+        try:
+            from langchain.schema import Document  # type: ignore
+        except Exception:
+            from langchain_core.documents import Document  # type: ignore
+
+        out = []
+        for row in self._rows:
+            metadata = dict(row.get("metadata") or {})
+            if filter and any(metadata.get(key) != value for key, value in filter.items()):
+                continue
+            out.append((Document(page_content=str(row.get("page_content") or ""), metadata=metadata), float(row.get("score") or 0.0)))
+            if len(out) >= max(1, int(k)):
+                break
+        return out
+
+    def get_documents(self, where: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        documents: List[str] = []
+        metadatas: List[Dict[str, Any]] = []
+        for row in self._rows:
+            metadata = dict(row.get("metadata") or {})
+            if where and any(metadata.get(key) != value for key, value in where.items()):
+                continue
+            documents.append(str(row.get("page_content") or ""))
+            metadatas.append(metadata)
+        return {"documents": documents, "metadatas": metadatas}
+
+    def updated_at(self) -> float:
+        return 0.0
 

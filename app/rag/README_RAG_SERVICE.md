@@ -12,8 +12,9 @@
 |---|---|---|---|
 | Embedding 统一 | 入库与检索可能配置不一致 | 入库与检索共用同一套配置（默认 BCE embedding） | 结果稳定，可复现 |
 | GPU 优先 | 可能未启用/不明确 | `RAG_DEVICE=auto` 时优先 cuda，否则 cpu | 加速入库与检索 |
-| 两阶段检索 | 只做向量检索 top_k | 向量 top_n（默认 30）-> rerank -> top_k | 召回更稳、排序更好 |
+| 两阶段检索 | 只做向量检索 top_k | Faiss-HNSW dense top_n + sparse 合并 -> rerank -> top_k | 召回更稳、排序更好 |
 | 证据契约 | 字段不固定 | 固定字段（eid/text/source/chunk_id/score/rerank_score/metadata） | 便于评测与前端展示 |
+| 语义缓存 | 无或仅本地缓存 | Redis 语义缓存（exact/semantic 命中） | 重复 query 延迟更低 |
 | 独立接口 | 无 | 新增 `/v1/rag/*` | Agent/前端/评测可复用 |
 
 ## 2. 接口
@@ -30,6 +31,7 @@ curl http://127.0.0.1:8000/v1/rag/stats
 
 ```json
 {
+  "backend": "faiss-hnsw",
   "collection": "medical_kb",
   "count": 801506,
   "persist_dir": ".../app/rag/kb_store",
@@ -64,6 +66,7 @@ curl -X POST http://127.0.0.1:8000/v1/rag/retrieve \
 
 返回：
 - `evidence` 为证据列表
+- `retrieval_meta` 为最近一次检索的元信息（如 `cache_hit/cache_mode/cache_backend/hybrid_enabled/dense_hits/sparse_hits`）
 - `stats` 为检索时刻的底座信息（不包含会话文本）
 
 注意：服务端日志只会记录 query 的前 100 个字符或哈希，不会泄漏完整内容。
@@ -92,6 +95,8 @@ curl -X POST http://127.0.0.1:8000/v1/rag/retrieve \
 - `RAG_TOP_N=30`：默认
 - `RAG_COLLECTION=medical_kb`
 - `RAG_PERSIST_DIR=app/rag/kb_store`
+- `RAG_CACHE_ENABLED=1`
+- `RAG_REDIS_URL=redis://...`（或复用 `AGENT_REDIS_URL`）
 
 兼容性：仍兼容旧变量（例如 `RAG_EMBEDDING_DEVICE`、`RAG_EMBEDDINGS_PROVIDER`、`RAG_BCE_MODEL`）。
 
@@ -108,7 +113,7 @@ curl -X POST http://127.0.0.1:8000/v1/rag/retrieve \
 - 首次使用会从 HuggingFace 下载模型
 - 可提前在稳定网络下完成一次检索/入库，后续会命中缓存
 
-### 5.3 Chroma 目录冲突/找不到库
+### 5.3 索引目录缺失/找不到库
 
 - 确认 `RAG_PERSIST_DIR` 指向正确目录（默认 `app/rag/kb_store`）
 - 若目录不存在：先运行 `python app/rag/ingest_kb.py`

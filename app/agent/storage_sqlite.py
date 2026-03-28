@@ -19,7 +19,7 @@ import os
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from app.agent.state import AgentSessionState, utc_now_iso
 
@@ -51,6 +51,9 @@ class SqliteSessionStore:
     def db_path(self) -> str:
         return str(self._db_path)
 
+    def storage_meta(self) -> Dict[str, Any]:
+        return {"type": "sqlite", "db_path": self.db_path}
+
     def _connect(self) -> sqlite3.Connection:
         # check_same_thread=False 允许跨线程使用；我们用锁控制写入。
         conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
@@ -67,6 +70,24 @@ class SqliteSessionStore:
                     CREATE TABLE IF NOT EXISTS sessions (
                       session_id TEXT PRIMARY KEY,
                       state_json TEXT NOT NULL,
+                      updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ocr_tasks (
+                      task_id TEXT PRIMARY KEY,
+                      session_id TEXT NOT NULL,
+                      source_url TEXT NOT NULL,
+                      source_name TEXT NOT NULL,
+                      source_kind TEXT NOT NULL,
+                      status TEXT NOT NULL,
+                      trace_id TEXT,
+                      ingested INTEGER NOT NULL DEFAULT 0,
+                      chunk_id TEXT,
+                      picked TEXT,
+                      message TEXT,
                       updated_at TEXT NOT NULL
                     )
                     """
@@ -139,3 +160,103 @@ class SqliteSessionStore:
                     conn.commit()
             except Exception as e:
                 raise RuntimeError(f"删除 session 失败：{type(e).__name__}: {e}") from e
+
+    def upsert_ocr_task(
+        self,
+        *,
+        task_id: str,
+        session_id: str,
+        source_url: str,
+        source_name: str,
+        source_kind: str,
+        status: str,
+        trace_id: str = "",
+        ingested: bool = False,
+        chunk_id: str = "",
+        picked: str = "",
+        message: str = "",
+    ) -> None:
+        tid = (task_id or "").strip()
+        sid = (session_id or "").strip()
+        if not tid or not sid:
+            raise RuntimeError("upsert_ocr_task 缺少 task_id 或 session_id")
+
+        updated_at = utc_now_iso()
+        with self._lock:
+            try:
+                with self._connect() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO ocr_tasks(
+                          task_id, session_id, source_url, source_name, source_kind,
+                          status, trace_id, ingested, chunk_id, picked, message, updated_at
+                        )
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(task_id) DO UPDATE SET
+                          session_id=excluded.session_id,
+                          source_url=excluded.source_url,
+                          source_name=excluded.source_name,
+                          source_kind=excluded.source_kind,
+                          status=excluded.status,
+                          trace_id=excluded.trace_id,
+                          ingested=excluded.ingested,
+                          chunk_id=excluded.chunk_id,
+                          picked=excluded.picked,
+                          message=excluded.message,
+                          updated_at=excluded.updated_at
+                        """,
+                        (
+                            tid,
+                            sid,
+                            str(source_url or ""),
+                            str(source_name or ""),
+                            str(source_kind or "url"),
+                            str(status or ""),
+                            str(trace_id or ""),
+                            1 if ingested else 0,
+                            str(chunk_id or ""),
+                            str(picked or ""),
+                            str(message or ""),
+                            updated_at,
+                        ),
+                    )
+                    conn.commit()
+            except Exception as e:
+                raise RuntimeError(f"保存 ocr_task 失败：{type(e).__name__}: {e}") from e
+
+    def get_ocr_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        tid = (task_id or "").strip()
+        if not tid:
+            return None
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    SELECT task_id, session_id, source_url, source_name, source_kind,
+                           status, trace_id, ingested, chunk_id, picked, message, updated_at
+                    FROM ocr_tasks
+                    WHERE task_id = ?
+                    """,
+                    (tid,),
+                )
+                row = cur.fetchone()
+        except Exception as e:
+            raise RuntimeError(f"读取 ocr_task 失败：{type(e).__name__}: {e}") from e
+
+        if not row:
+            return None
+
+        return {
+            "task_id": str(row[0] or ""),
+            "session_id": str(row[1] or ""),
+            "source_url": str(row[2] or ""),
+            "source_name": str(row[3] or ""),
+            "source_kind": str(row[4] or ""),
+            "status": str(row[5] or ""),
+            "trace_id": str(row[6] or ""),
+            "ingested": bool(row[7]),
+            "chunk_id": str(row[8] or ""),
+            "picked": str(row[9] or ""),
+            "message": str(row[10] or ""),
+            "updated_at": str(row[11] or ""),
+        }

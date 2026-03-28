@@ -204,7 +204,7 @@ def _import_embeddings_interface():
 
 
 def make_embeddings() -> Tuple[object, EmbeddingInfo]:
-    """Create embedding function for LangChain/Chroma.
+    """Create embedding function for the current RAG backend.
 
     Default provider is BCEmbedding; if unavailable, fallback to HuggingFaceEmbeddings with a clear warning.
     Supports CUDA, MPS (Apple Silicon), and CPU. MPS will fallback to CPU if not supported.

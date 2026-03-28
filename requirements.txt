@@ -6,12 +6,13 @@ pydantic==2.12.5
 # LLM + agent orchestration (Python 3.9 compatible)
 openai==0.28.1
 langchain==0.0.352
-langchain-community>=0.0.10
+langchain-community==0.0.20
 langgraph==0.0.20
 
-# Local RAG (Chroma + embeddings)
-chromadb==1.3.7
-sentence-transformers==5.1.2
+# Local RAG (Faiss-HNSW + embeddings)
+faiss-cpu==1.13.2
+sentence-transformers==2.6.1
+transformers==4.36.2
 BCEmbedding>=0.1.5  # Required for embedding & reranking (maidalun1020/bce-embedding-base_v1)
 
 # PyTorch - GPU acceleration for embeddings
@@ -23,9 +24,11 @@ torch>=2.0.0
 # Utilities
 requests
 httpx
+python-multipart
 wikipedia
 tiktoken
 typing_extensions
+redis==5.2.1
 
 # Dev / tests
 pytest

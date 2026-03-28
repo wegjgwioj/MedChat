@@ -1,6 +1,6 @@
 # MedCaht 后端系统说明书（System Spec）
 
-版本：2025-12-23
+版本：2026-03-28
 
 本说明书仅覆盖后端系统（FastAPI / M1 RAG / M2 LangGraph Agent / 评测闭环），不包含前端。
 
@@ -23,6 +23,7 @@
 - 非诊断：系统输出为信息参考与就医建议，不给出确定诊断结论。
 - 免责声明：M2 Answer 输出强制包含免责声明（见 [app/agent/graph.py](../app/agent/graph.py) 的 `_ensure_answer_contract()`）。
 - 红旗分流：出现高风险症状时系统应进入 Escalate（建议急诊/线下就医），不继续追问或给出治疗方案（见 `_node_safety_gate()`）。
+- Phase 0 护栏：越域请求与 prompt 攻击型输入应在进入槽位抽取前被拦截，并返回医疗问诊范围内的提示（见 `_classify_phase0_guardrail()` 与 `_node_safety_gate()`）。
 
 ---
 
@@ -39,8 +40,10 @@
 ### 2.2 状态转移条件（以真实代码为准）
 
 - 安全门（SafetyGate）
-  - 条件：`_looks_like_red_flag(user_message)` 命中关键词列表
-  - 动作：`state["mode"] = "escalate"`，并填充 `ESCALATE_ANSWER_TEMPLATE`
+  - 条件 1：`_classify_phase0_guardrail(user_message)` 判定为越域请求或 prompt 攻击
+    - 动作：直接短路，返回固定拒答模板，并在 `trace.phase0_guardrail` 中记录 `blocked/label/reason`
+  - 条件 2：`_looks_like_red_flag(user_message)` 命中关键词列表
+    - 动作：`state["mode"] = "escalate"`，并填充 `ESCALATE_ANSWER_TEMPLATE`
   - 证据：见 [app/agent/graph.py](../app/agent/graph.py) 的 `_node_safety_gate()`。
 
 - 规划器（TriagePlanner）
@@ -77,43 +80,45 @@
 
 2) 会话加载：
 
-- 从 SQLite 读取 `AgentSessionState`（messages/slots/summary）。
-- 默认路径：`<repo>/app/data/agent_sessions.sqlite3`。
+- 从 Redis 读取 `AgentSessionState`（messages/slots/summary/longitudinal_records）。
+- 连接由 `AGENT_REDIS_URL` 决定。
 
-证据：见 [app/agent/storage_sqlite.py](../app/agent/storage_sqlite.py) 的 `default_db_path()` 与 `SqliteSessionStore.load_session()`。
+证据：见 [app/agent/storage.py](../app/agent/storage.py) 与 [app/agent/storage_redis.py](../app/agent/storage_redis.py)。
 
 3) 槽位与摘要：
 
 - `MemoryUpdate` 将用户消息追加到 `messages`（只保留最近 20 轮），并抽取槽位后合并。
 - `summary` 使用规则生成（避免额外 LLM 带来的不确定性）。
+- 稳定病史会写入 `longitudinal_records`，再聚合为 `record_summary` 参与后续检索与安全校验。
 
-证据：见 [app/agent/state.py](../app/agent/state.py) 的 `AgentSessionState.append_message()`、`trim_messages()`、`build_summary_from_slots()`。
+证据：见 [app/agent/state.py](../app/agent/state.py) 的 `AgentSessionState.append_message()`、`trim_messages()`、`build_summary_from_slots()`，以及 [app/agent/record_index.py](../app/agent/record_index.py)。
 
 4) RAG：
 
-- 构造 `rag_query = summary + "；问题：" + user_message`，可带 department 过滤。
+- `trace.planner_strategy == "kb_qa"` 时，构造 `rag_query = "问题：" + user_message`，直接走知识问答检索。
+- 常规问诊路径会先根据 slots 生成结构化 `chief_complaint`，再构造 `rag_query = record_summary + "；主诉：" + chief_complaint`；若主诉为空才退回 `summary`。
 - 调用 [app/rag/retriever.py](../app/rag/retriever.py) 兼容层最终落到 [app/rag/rag_core.py](../app/rag/rag_core.py) 的 `retrieve()`。
 
 证据：见 [app/agent/graph.py](../app/agent/graph.py) 的 `_node_rag_retrieve()`。
 
 5) 回答生成：
 
-- evidence 为空：不调用 LLM，走 deterministic fallback answer。
+- evidence 质量不足：不调用 LLM，走低证据回答模板，并继续执行记录冲突检测。
 - evidence 非空：调用 LLM 生成回答，并强制加入引用行与免责声明。
 
 证据：见 [app/agent/graph.py](../app/agent/graph.py) 的 `_node_answer_compose()` 与 `_ensure_answer_contract()`。
 
 6) 持久化：
 
-- 将更新后的 session 写回 SQLite。
-- trace 中返回 `storage.db_path`。
+- 将更新后的 session 写回 Redis。
+- trace 中返回 `storage.type/key_prefix/redis_url`。
 
 证据：见 [app/agent/graph.py](../app/agent/graph.py) 的 `_node_persist_state()`。
 
 ### 3.2 `/v1/rag/retrieve` 控制流
 
 - `api_server.rag_retrieve()` 负责鉴权、日志安全（query 前 100 字或 hash）、并调用 `rag_core.retrieve()`。
-- 响应返回 `evidence` 与 `stats`（collection/count/device/embed_model/rerank_model）。
+- 响应返回 `evidence` 与 `stats`（backend/collection/count/device/embed_model/rerank_model）。
 
 证据：见 [app/api_server.py](../app/api_server.py) 的 `rag_retrieve()`。
 
@@ -135,7 +140,7 @@
 
 - `/v1/chat` 默认仅保存 meta（present/length/sha256），除非 `ALLOW_SAVE_SESSION_RAW_TEXT=1`。
   - 证据：见 [app/api_server.py](../app/api_server.py) 的 `chat()`、`_text_meta()`。
-- `/v1/agent/chat_v2` 持久化到 SQLite：保存最近 20 轮 message（最长 4000 字）。
+- `/v1/agent/chat_v2` 持久化到 Redis：保存最近 20 轮 message（最长 4000 字）。
   - 证据：见 [app/agent/state.py](../app/agent/state.py) 的 `AgentSessionState.trim_messages()`。
 
 ---
@@ -156,11 +161,17 @@
   - 节点执行顺序（包含：SafetyGate/MemoryUpdate/TriagePlanner/RAGRetrieve/AnswerCompose/PersistState）。
 - `trace.timings_ms: { [node: string]: int }`
   - 每节点耗时（毫秒）。
-- `trace.rag_stats: { hits?: int, latency_ms?: int, device?: string, collection?: string, count?: int }`
+- `trace.phase0_guardrail?: { blocked: bool, label?: string, reason?: string }`
+  - 链路最前端护栏结果。
+- `trace.record_admission?: { admitted?: int, merged?: int, dropped?: int, total_records?: int }`
+  - 纵向档案准入结果。
+- `trace.rag_stats: { hits?: int, latency_ms?: int, device?: string, collection?: string, count?: int, backend?: string, cache_hit?: bool, cache_mode?: string, cache_backend?: string, dense_hits?: int, sparse_hits?: int }`
   - RAG 节点的统计信息。
 - `trace.planner_strategy?: string`
   - 规划器策略（如 kb_qa）。
-- `trace.storage?: { type: string, db_path: string }`
+- `trace.chief_complaint?: string`
+  - 常规问诊路径下生成的结构化主诉，用于检索和前端调试面板展示。
+- `trace.storage?: { type: string, redis_url?: string, key_prefix?: string }`
   - 存储后端信息。
 
 证据：见 [app/agent/graph.py](../app/agent/graph.py) 的 `_trace_start/_trace_end/_node_rag_retrieve/_node_persist_state`，以及单测 [tests/test_agent_graph_trace.py](../tests/test_agent_graph_trace.py)。

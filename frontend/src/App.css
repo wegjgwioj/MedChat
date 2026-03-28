@@ -260,6 +260,18 @@
   color: #991b1b;
 }
 
+.bubbleStreaming {
+  border-color: #bae6fd;
+  background: #eff6ff;
+  color: #1e3a8a;
+}
+
+.streamStatus {
+  font-size: 12px;
+  color: #2563eb;
+  margin-bottom: 6px;
+}
+
 .escalateHint {
   font-size: 12px;
   color: #991b1b;

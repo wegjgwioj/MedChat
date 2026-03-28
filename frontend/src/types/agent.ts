@@ -3,6 +3,8 @@ export type AgentChatV2Mode = 'ask' | 'answer' | 'escalate'
 export type AgentCitation = {
   eid: string
   score: number
+  bm25_score?: number
+  hybrid_score?: number
   department?: string
   title?: string
   snippet?: string

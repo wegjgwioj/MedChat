@@ -68,6 +68,18 @@ function EvidenceCard({ c }: { c: AgentCitation }) {
       <div className="evidenceCardMeta">
         <span className="metaKey">score</span>
         <span className="metaVal">{Number.isFinite(c.score) ? c.score.toFixed(4) : '-'}</span>
+        {typeof c.bm25_score === 'number' ? (
+          <>
+            <span className="metaKey">bm25</span>
+            <span className="metaVal">{c.bm25_score.toFixed(4)}</span>
+          </>
+        ) : null}
+        {typeof c.hybrid_score === 'number' ? (
+          <>
+            <span className="metaKey">hybrid</span>
+            <span className="metaVal">{c.hybrid_score.toFixed(4)}</span>
+          </>
+        ) : null}
         {typeof c.rerank_score === 'number' ? (
           <>
             <span className="metaKey">rerank</span>

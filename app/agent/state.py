@@ -13,12 +13,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 TriState = Literal["yes", "no", "unknown"]
 Role = Literal["user", "assistant", "system"]
 RecordCategory = Literal["demographic", "pregnancy", "allergy", "history", "medication"]
+PendingFactStatus = Literal["pending", "confirmed", "rejected"]
 
 
 def utc_now_iso() -> str:
@@ -38,6 +39,17 @@ class LongitudinalRecordFact(BaseModel):
     text: str = Field(default="", description="用于相似度计算的规范化文本")
     importance_score: float = Field(default=0.0, description="重要性评分，0-1")
     updated_at: str = Field(default_factory=utc_now_iso, description="最近更新时间")
+
+
+class PendingRecordFact(BaseModel):
+    fact_id: str
+    category: RecordCategory
+    label: str = Field(default="")
+    value: str = Field(default="")
+    source_kind: str = Field(default="ocr")
+    source_excerpt: str = Field(default="")
+    status: PendingFactStatus = Field(default="pending")
+    created_at: str = Field(default_factory=utc_now_iso)
 
 
 class Slots(BaseModel):
@@ -103,12 +115,15 @@ class Slots(BaseModel):
 
 
 class AgentSessionState(BaseModel):
+    model_config = ConfigDict(validate_assignment=True)
+
     session_id: str
     messages: List[Message] = Field(default_factory=list, description="最近 N 轮对话")
     slots: Slots = Field(default_factory=Slots)
     summary: str = Field(default="", description="短摘要，用于构建 rag_query 与 LLM 上下文")
     record_summary: str = Field(default="", description="纵向档案摘要，优先保留年龄/过敏史/既往史/用药等稳定信息")
     longitudinal_records: List[LongitudinalRecordFact] = Field(default_factory=list, description="纵向档案事实索引，按重要性和相似阈值入库")
+    pending_record_facts: List[PendingRecordFact] = Field(default_factory=list, description="待用户确认的病历事实")
 
     # 为动态追问与防重复服务：
     # - asked_slots：历史已追问过的槽位集合（只存字段名）

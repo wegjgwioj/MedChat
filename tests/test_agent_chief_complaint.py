@@ -123,16 +123,23 @@ def test_node_rag_retrieve_keeps_raw_question_for_kb_qa(monkeypatch) -> None:
     assert captured["rag_query"] == "问题：风疹病毒是怎么感染的？"
 
 
-def test_run_chat_v2_turn_records_chief_complaint_in_trace_and_rag_query(monkeypatch) -> None:
+def test_run_chat_v2_turn_records_chief_complaint_in_trace_and_rag_query(monkeypatch, tmp_path) -> None:
     from app.agent import graph
+    import app.agent.record_index as record_index
     from app.agent.state import Slots
+    from app.agent.storage_sqlite import SqliteSessionStore
     import app.rag.retriever as retriever
     import app.rag.rag_core as rag_core
 
     captured = {}
 
     graph._GRAPH = None
-    graph._STORE = None
+    graph._STORE = SqliteSessionStore(tmp_path / "agent_sessions.sqlite3")
+    monkeypatch.setattr(
+        record_index,
+        "_compute_record_similarity",
+        lambda left, right: 1.0 if left == right else 0.05,
+    )
     monkeypatch.setattr(
         graph,
         "_extract_slots_with_llm",

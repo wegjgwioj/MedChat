@@ -91,6 +91,7 @@ def guard_medication_candidates(candidates, constraints) -> Dict[str, Any]:
                 "constraint_id": str(matched_constraint.get("constraint_id") or "").strip(),
                 "constraint_type": str(matched_constraint.get("constraint_type") or "").strip(),
                 "medication_name": candidate_name,
+                "source_fact_value": str(matched_constraint.get("source_fact_value") or "").strip(),
                 "warning_message": warning_message,
             }
         )

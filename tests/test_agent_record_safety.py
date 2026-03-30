@@ -26,21 +26,31 @@ def test_memory_update_builds_record_summary(monkeypatch, tmp_path):
     assert "用药：维生素" in sess.record_summary
 
 
-def test_answer_compose_applies_record_conflict_warning(monkeypatch):
+def test_answer_compose_removes_conflicting_medication_but_keeps_other_advice(monkeypatch):
     from app.agent import graph
-    from app.agent.state import AgentSessionState
-    import app.safety.conflict_judge as conflict_judge
+    from app.agent.state import AgentSessionState, LongitudinalRecordFact
 
     monkeypatch.setattr(
         graph,
         "_call_llm_text",
-        lambda system, user: "建议先口服阿莫西林。[E1]\n\n引用：[E1]\n免责声明：本回答仅供信息参考，不能替代医生面诊。",
+        lambda system, user: (
+            "建议先口服阿莫西林；如发热可考虑对乙酰氨基酚。[E1]\n\n"
+            "引用：[E1]\n免责声明：本回答仅供信息参考，不能替代医生面诊。"
+        ),
     )
-    monkeypatch.setattr(conflict_judge, "_predict_conflict_scores", lambda premise, hypotheses: [0.95 for _ in hypotheses])
 
     sess = AgentSessionState(
-        session_id="s-record-2",
+        session_id="s-guard-1",
         summary="症状：咽痛",
+        longitudinal_records=[
+            LongitudinalRecordFact(
+                category="allergy",
+                label="过敏",
+                value="青霉素过敏",
+                text="过敏：青霉素过敏",
+                importance_score=0.98,
+            )
+        ],
         record_summary="过敏：青霉素过敏",
     )
     state = {
@@ -58,25 +68,33 @@ def test_answer_compose_applies_record_conflict_warning(monkeypatch):
     out = graph._node_answer_compose(state)
 
     assert "青霉素过敏" in out["answer"]
-    assert "阿莫西林" in out["answer"]
-    assert state["trace"]["record_conflicts"][0]["matched_term"] == "阿莫西林"
+    assert "建议先口服阿莫西林" not in out["answer"]
+    assert "对乙酰氨基酚" in out["answer"]
+    assert state["trace"]["medication_safety"]["blocked_count"] == 1
 
 
 def test_answer_compose_does_not_flag_negative_warning_context(monkeypatch):
     from app.agent import graph
-    from app.agent.state import AgentSessionState
-    import app.safety.conflict_judge as conflict_judge
+    from app.agent.state import AgentSessionState, LongitudinalRecordFact
 
     monkeypatch.setattr(
         graph,
         "_call_llm_text",
-        lambda system, user: "你对青霉素过敏，因此应避免阿莫西林。[E1]\n\n引用：[E1]\n免责声明：本回答仅供信息参考，不能替代医生面诊。",
+        lambda system, user: "你对青霉素过敏，因此应避免阿莫西林；如发热可用对乙酰氨基酚。[E1]\n\n引用：[E1]\n免责声明：本回答仅供信息参考，不能替代医生面诊。",
     )
-    monkeypatch.setattr(conflict_judge, "_predict_conflict_scores", lambda premise, hypotheses: [0.05 for _ in hypotheses])
 
     sess = AgentSessionState(
         session_id="s-record-3",
         summary="症状：咽痛",
+        longitudinal_records=[
+            LongitudinalRecordFact(
+                category="allergy",
+                label="过敏",
+                value="青霉素过敏",
+                text="过敏：青霉素过敏",
+                importance_score=0.98,
+            )
+        ],
         record_summary="过敏：青霉素过敏",
     )
     state = {
@@ -94,4 +112,4 @@ def test_answer_compose_does_not_flag_negative_warning_context(monkeypatch):
     out = graph._node_answer_compose(state)
 
     assert out["answer"].count("应避免阿莫西林") == 1
-    assert state["trace"]["record_conflicts"] == []
+    assert state["trace"]["medication_safety"]["blocked_count"] == 0

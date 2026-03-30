@@ -29,7 +29,7 @@ htmlcov/
 *.sqlite3-shm
 *.sqlite3-wal
 *.db
-
+.env
 # ===== Project-generated outputs =====
 outputs/
 .worktrees/
@@ -78,3 +78,4 @@ Thumbs.db
 .idea/
 .vscode/*
 !.vscode/extensions.json
+.env

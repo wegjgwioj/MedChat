@@ -108,7 +108,7 @@ def _sha256_text(text: str) -> str:
 
 
 def _safe_text_for_log(text: str) -> str:
-    s = (text or "").strip()
+    s = redact_pii_for_llm((text or "").strip())
     if not s:
         return "(empty)"
     prefix = s[:100]
@@ -525,12 +525,17 @@ def _apply_confirmed_medication_safety(state: AgentGraphState, sess: AgentSessio
 
     tr_any = state.get("trace")
     tr = tr_any if isinstance(tr_any, dict) else {}
+    blocked_count = len(guard_result.get("blocked_medications", []) or [])
     tr["medication_safety"] = {
         "constraint_count": len(constraints),
         "candidate_count": len(candidates),
         "allowed_count": len(guard_result.get("allowed_medications", []) or []),
-        "blocked_count": len(guard_result.get("blocked_medications", []) or []),
+        "blocked_count": blocked_count,
         "warning_count": len(guard_result.get("warnings", []) or []),
+        "rule_checks": len(candidates),
+        "rule_blocked": blocked_count,
+        "model_judge_used": False,
+        "model_confirmed": 0,
     }
     state["trace"] = cast(Dict[str, Any], tr)
 

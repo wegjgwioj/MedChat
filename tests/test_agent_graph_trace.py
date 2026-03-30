@@ -91,3 +91,7 @@ def test_answer_trace_includes_medication_safety(monkeypatch):
     trace = state["trace"]
     assert "medication_safety" in trace
     assert trace["medication_safety"]["blocked_count"] == 1
+    assert trace["medication_safety"]["rule_checks"] >= 1
+    assert trace["medication_safety"]["rule_blocked"] == 1
+    assert trace["medication_safety"]["model_judge_used"] is False
+    assert trace["medication_safety"]["model_confirmed"] == 0

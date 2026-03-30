@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 
 def test_build_plan_respects_skip_flags(tmp_path: Path):
     from scripts import eval_run_all
@@ -83,3 +85,20 @@ def test_main_runs_commands_and_writes_suite_summary(monkeypatch, tmp_path: Path
     suite = json.loads(suite_path.read_text(encoding="utf-8"))
     assert suite["executed_steps"] == ["meddg_e2e", "perf"]
     assert suite["skipped_steps"] == ["rag_quality"]
+
+
+def test_resolve_required_meddg_path_raises_before_subprocess_when_suite_needs_data(tmp_path: Path):
+    from scripts import eval_run_all
+
+    with pytest.raises(FileNotFoundError) as exc:
+        eval_run_all.resolve_required_meddg_path(
+            meddg_path=None,
+            skip_meddg=False,
+            skip_rag=False,
+            repo_root=tmp_path,
+        )
+
+    message = str(exc.value)
+    assert "MedDG" in message
+    assert "test.pk" in message
+    assert "仓库默认不附带" in message

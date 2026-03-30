@@ -52,6 +52,22 @@ def test_eval_cli_raises_clear_error_when_meddg_file_missing(tmp_path: Path):
     message = str(exc.value)
     assert "MedDG" in message
     assert "test.pk" in message
+    assert "仓库默认不附带" in message
+
+
+def test_eval_rag_cli_raises_clear_error_when_meddg_file_missing(tmp_path: Path):
+    from scripts import eval_rag_quality
+
+    parser = eval_rag_quality.build_arg_parser()
+    args = parser.parse_args(["--meddg_dir", str(tmp_path / "missing_dir"), "--split", "test"])
+
+    with pytest.raises(FileNotFoundError) as exc:
+        eval_rag_quality.resolve_meddg_path(args)
+
+    message = str(exc.value)
+    assert "MedDG" in message
+    assert "test.pk" in message
+    assert "仓库默认不附带" in message
 
 
 def test_eval_perf_concurrency_parser_accepts_space_or_csv():

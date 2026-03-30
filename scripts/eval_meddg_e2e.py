@@ -128,6 +128,7 @@ def resolve_meddg_path(args: argparse.Namespace) -> Path:
     if not meddg_path.exists():
         raise FileNotFoundError(
             f"MedDG 数据文件不存在：{meddg_path}。"
+            "仓库默认不附带 MedDG 数据；"
             "可通过 --meddg_path 显式指定，或准备 app/MedDG_UTF8/<split>.pk 后再运行。"
         )
     return meddg_path

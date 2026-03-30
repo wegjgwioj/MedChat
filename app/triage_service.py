@@ -221,6 +221,10 @@ def _apply_record_safety(answer_json: Dict[str, Any], clinical_record_text: str,
             "step": "record.safety",
             "status": "disabled_unconfirmed_source",
             "reason": "clinical_record_path requires in-dialog confirmation",
+            "rule_checks": 0,
+            "rule_blocked": 0,
+            "model_judge_used": False,
+            "model_confirmed": 0,
         }
     )
     out = dict(answer_json if isinstance(answer_json, dict) else {})

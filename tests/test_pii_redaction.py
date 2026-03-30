@@ -22,6 +22,41 @@ def test_redact_pii_for_llm_masks_phone_id_and_address() -> None:
     assert "<ADDRESS>" in redacted
 
 
+def test_redact_pii_for_llm_masks_explicit_contact_name() -> None:
+    from app.privacy.pii import redact_pii_for_llm
+
+    text = "我叫张三，最近头痛两天。"
+    redacted = redact_pii_for_llm(text)
+
+    assert "张三" not in redacted
+    assert "<NAME>" in redacted
+
+
+def test_safe_log_helpers_redact_pii_before_truncating() -> None:
+    import app.agent.graph as graph
+    import app.agent.router as agent_router
+    import app.api_server as api_server
+    import app.rag.rag_core as rag_core
+
+    text = "我叫张三，电话13800138000，身份证110101199001011234，住址北京市朝阳区酒仙桥路10号。"
+
+    for helper in (
+        graph._safe_text_for_log,
+        agent_router._safe_for_log,
+        api_server._safe_query_for_log,
+        rag_core._safe_query_for_log,
+    ):
+        masked = helper(text)
+        assert "张三" not in masked
+        assert "13800138000" not in masked
+        assert "110101199001011234" not in masked
+        assert "酒仙桥路10号" not in masked
+        assert "<NAME>" in masked
+        assert "<PHONE>" in masked
+        assert "<IDCARD>" in masked
+        assert "<ADDRESS>" in masked
+
+
 def test_triage_assess_redacts_user_text_before_llm(monkeypatch) -> None:
     import app.triage_service as triage_service
 
@@ -114,11 +149,24 @@ def test_agent_answer_compose_redacts_user_text_before_llm(monkeypatch, tmp_path
     import app.agent.graph as graph
     import app.rag.retriever as retriever
     import app.rag.rag_core as rag_core
-    from app.agent.storage_sqlite import SqliteSessionStore
 
     graph._GRAPH = None
     monkeypatch.setattr(graph, "_extract_slots_with_llm", graph._rule_extract_slots)
-    monkeypatch.setattr(graph, "_STORE", SqliteSessionStore(Path(tmp_path) / "agent.sqlite3"))
+
+    class FakeStore:
+        def load_session(self, session_id):
+            return None
+
+        def save_session(self, state):
+            return None
+
+        def delete_session(self, session_id):
+            return None
+
+        def storage_meta(self):
+            return {"backend": "fake"}
+
+    monkeypatch.setattr(graph, "_STORE", FakeStore())
 
     captured = {}
 
@@ -210,3 +258,36 @@ def test_query_slimming_redacts_user_text_before_openai(monkeypatch) -> None:
 
     result = rag_core._rewrite_query_slimming("我电话13800138000，身份证110101199001011234，住在北京市朝阳区酒仙桥路10号，风疹病毒怎么感染？")
     assert result == "风疹 感染 传播"
+
+
+def test_query_slimming_demo_output_redacts_logged_query(monkeypatch, capsys) -> None:
+    import app.rag.rag_core as rag_core
+
+    class FakeResponse:
+        choices = [types.SimpleNamespace(message={"content": "风疹 感染 传播"})]
+
+    class FakeChatCompletion:
+        @staticmethod
+        def create(**kwargs):
+            return FakeResponse()
+
+    fake_openai = types.SimpleNamespace(
+        api_key=None,
+        api_base=None,
+        ChatCompletion=FakeChatCompletion,
+    )
+
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-chat")
+
+    rag_core._rewrite_query_slimming("我叫张三，电话13800138000，住在北京市朝阳区酒仙桥路10号，风疹病毒怎么感染？")
+    out = capsys.readouterr().out
+
+    assert "张三" not in out
+    assert "13800138000" not in out
+    assert "酒仙桥路10号" not in out
+    assert "<NAME>" in out
+    assert "<PHONE>" in out
+    assert "<ADDRESS>" in out

@@ -72,8 +72,13 @@ def test_triage_once_trace_marks_external_record_veto_as_disabled(monkeypatch, t
     )
 
     trace = payload["meta"]["trace"]
-    assert any(step.get("step") == "record.safety" for step in trace)
-    assert any(step.get("status") == "disabled_unconfirmed_source" for step in trace if step.get("step") == "record.safety")
+    record_steps = [step for step in trace if step.get("step") == "record.safety"]
+    assert record_steps
+    assert any(step.get("status") == "disabled_unconfirmed_source" for step in record_steps)
+    assert all(step.get("rule_checks") == 0 for step in record_steps)
+    assert all(step.get("rule_blocked") == 0 for step in record_steps)
+    assert all(step.get("model_judge_used") is False for step in record_steps)
+    assert all(step.get("model_confirmed") == 0 for step in record_steps)
 
 
 def test_triage_once_does_not_treat_negative_warning_fields_as_positive_conflict(monkeypatch, tmp_path):

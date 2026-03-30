@@ -1,6 +1,6 @@
 # MedDG 评测闭环（课程设计/企业验收版）
 
-本目录描述“如何用 MedDG 对 MedCaht 做可复现评测”，覆盖：
+本目录描述“如何用 MedDG 对 MedChat 做可复现评测”，覆盖：
 
 - C1 端到端多轮对话评测（调用后端 `/v1/agent/chat_v2`）
 - C2 RAG 离线质量评估（调用 `/v1/rag/retrieve`，不依赖 LLM 文本质量）
@@ -8,7 +8,7 @@
 
 ## 数据格式（MedDG pickle 版）
 
-MedDG 的 `train.pk/test.pk/dev.pk` 在本仓库里表现为：
+如果你自行准备了 MedDG 的 `train.pk/test.pk/dev.pk`，脚本默认假设其 pickle 结构为：
 
 - 顶层是 `list`，每个元素是一段对话（`dialogue`）
 - 每段对话是 `list[dict]`，每个 dict 是一轮，典型字段：
@@ -47,6 +47,12 @@ MedDG 的 `train.pk/test.pk/dev.pk` 在本仓库里表现为：
 - 并发=1/5/10；每个并发发起请求数=20（可配）
 - 统计 `avg_ms/p95_ms/error_rate`
 
+## 仓库现状说明
+
+- 仓库默认只保留 `app/MedDG_UTF8/.gitkeep` 作为占位目录
+- 仓库默认不附带正式 MedDG 数据文件
+- 运行 `eval_meddg_e2e.py` / `eval_rag_quality.py` / `eval_run_all.py` 时，请通过 `--meddg_path` 提供你本地的实际数据路径
+
 ## 复现步骤
 
 1) 启动后端：
@@ -58,9 +64,10 @@ uvicorn app.api_server:app --host 127.0.0.1 --port 8000 --reload
 2) 运行评测：
 
 ```powershell
-python scripts/eval_meddg_e2e.py --meddg_path app/MedDG_UTF8/test.pk --n 100 --base_url http://127.0.0.1:8000
-python scripts/eval_rag_quality.py --meddg_path app/MedDG_UTF8/test.pk --n 200 --top_k 5 --base_url http://127.0.0.1:8000
+python scripts/eval_meddg_e2e.py --meddg_path <你的实际 MedDG test.pk 路径> --n 100 --base_url http://127.0.0.1:8000
+python scripts/eval_rag_quality.py --meddg_path <你的实际 MedDG test.pk 路径> --n 200 --top_k 5 --base_url http://127.0.0.1:8000
 python scripts/eval_perf.py --base_url http://127.0.0.1:8000 --concurrency 1,5,10 --requests 20
+python scripts/eval_run_all.py --base_url http://127.0.0.1:8000 --meddg_path <你的实际 MedDG test.pk 路径>
 ```
 
 3) 查看产物：
@@ -70,3 +77,6 @@ python scripts/eval_perf.py --base_url http://127.0.0.1:8000 --concurrency 1,5,1
 - `reports/rag_eval_summary.json`
 - `reports/rag_eval_details.csv`
 - `reports/perf_eval.json`
+- `reports/eval_suite_summary.json`
+
+在尚未运行评测前，`reports/` 目录可以为空，这是正常状态。

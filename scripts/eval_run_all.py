@@ -16,6 +16,7 @@ _STEP_TO_ARTIFACT = {
     "rag_quality": "rag_eval_summary.json",
     "perf": "perf_eval.json",
 }
+_DEFAULT_MEDDG_RELATIVE_PATH = Path("app/MedDG_UTF8/test.pk")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -77,6 +78,31 @@ def collect_suite_summary(*, out_dir: Path, executed_steps: List[str], skipped_s
     }
 
 
+def resolve_required_meddg_path(
+    *,
+    meddg_path: Optional[Path],
+    skip_meddg: bool,
+    skip_rag: bool,
+    repo_root: Optional[Path] = None,
+) -> Optional[Path]:
+    if skip_meddg and skip_rag:
+        return meddg_path
+
+    candidate = meddg_path
+    if candidate is None:
+        base = repo_root if repo_root is not None else Path.cwd()
+        candidate = base / _DEFAULT_MEDDG_RELATIVE_PATH
+
+    if candidate.exists():
+        return candidate
+
+    raise FileNotFoundError(
+        f"MedDG 数据文件不存在：{candidate}。"
+        "仓库默认不附带 MedDG 数据；"
+        "可通过 --meddg_path 显式指定，或自行准备 app/MedDG_UTF8/<split>.pk 后再运行。"
+    )
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
@@ -84,6 +110,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     meddg_path = Path(args.meddg_path) if args.meddg_path else None
+    meddg_path = resolve_required_meddg_path(
+        meddg_path=meddg_path,
+        skip_meddg=bool(args.skip_meddg),
+        skip_rag=bool(args.skip_rag),
+        repo_root=Path.cwd(),
+    )
 
     plan = build_run_plan(
         base_url=args.base_url,

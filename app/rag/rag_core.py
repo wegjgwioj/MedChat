@@ -80,7 +80,7 @@ def _sha256_text(text: str) -> str:
 
 
 def _safe_query_for_log(query: str) -> str:
-    q = (query or "").strip()
+    q = redact_pii_for_llm((query or "").strip())
     if not q:
         return "(empty)"
     prefix = q[:100]
@@ -126,9 +126,10 @@ def _rewrite_query_slimming(query: str) -> str:
             slimming_q = str(getattr(message, "content", "") or "").strip()
 
         # 5. 演示日志
+        safe_query = _safe_query_for_log(query)
         print("\n" + "—" * 40)
         print("【M1 检索优化：DeepSeek 语义提纯】")
-        print(f"原始提问: {query[:50]}...")
+        print(f"原始提问: {safe_query}")
         print(f"瘦身结果: {slimming_q}")
         print("—" * 40 + "\n")
 

@@ -61,6 +61,7 @@ _TRACE_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("trace
 from app.agent.state import AgentSessionState, PendingRecordFact
 from app.agent.storage import build_session_store
 from app.agent.storage_sqlite import SqliteSessionStore
+from app.privacy import redact_pii_for_llm
 
 _OCR_STORE = SqliteSessionStore()
 
@@ -255,7 +256,7 @@ def _sha256_text(text: str) -> str:
 
 
 def _safe_query_for_log(query: str) -> str:
-    q = (query or "").strip()
+    q = redact_pii_for_llm((query or "").strip())
     if not q:
         return "(empty)"
     prefix = q[:100]

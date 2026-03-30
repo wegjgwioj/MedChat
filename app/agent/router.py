@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 
 from app.agent.graph import run_chat_v2_turn
+from app.privacy import redact_pii_for_llm
 
 
 logger = logging.getLogger(__name__)
@@ -36,7 +37,7 @@ def _sha256_text(text: str) -> str:
 
 
 def _safe_for_log(text: str) -> str:
-    s = (text or "").strip()
+    s = redact_pii_for_llm((text or "").strip())
     if not s:
         return "(empty)"
     prefix = s[:100]

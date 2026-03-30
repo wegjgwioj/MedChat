@@ -216,34 +216,16 @@ def _apply_record_safety(answer_json: Dict[str, Any], clinical_record_text: str,
     if not record_text:
         return answer_json
 
-    serialized = json.dumps(answer_json or {}, ensure_ascii=False)
-    conflicts = detect_record_conflicts(serialized, record_text)
-    confirmed_conflicts, dismissed_conflicts = judge_json_conflicts(answer_json, conflicts)
-    if confirmed_conflicts:
-        trace.append(
-            {
-                "step": "record.safety",
-                "status": "conflict",
-                "count": len(confirmed_conflicts),
-                "matched_terms": [str(item.get("matched_term") or "") for item in confirmed_conflicts],
-                "dismissed_count": len(dismissed_conflicts),
-            }
-        )
-        return apply_record_conflicts_to_triage_json(answer_json, confirmed_conflicts)
-
-    if dismissed_conflicts:
-        trace.append(
-            {
-                "step": "record.safety",
-                "status": "dismissed",
-                "count": 0,
-                "dismissed_count": len(dismissed_conflicts),
-            }
-        )
-        return apply_record_conflicts_to_triage_json(answer_json, [])
-
-    trace.append({"step": "record.safety", "status": "ok", "count": 0})
-    return answer_json
+    trace.append(
+        {
+            "step": "record.safety",
+            "status": "disabled_unconfirmed_source",
+            "reason": "clinical_record_path requires in-dialog confirmation",
+        }
+    )
+    out = dict(answer_json if isinstance(answer_json, dict) else {})
+    out["record_conflicts"] = []
+    return out
 
 
 def _default_low_evidence_questions() -> List[str]:

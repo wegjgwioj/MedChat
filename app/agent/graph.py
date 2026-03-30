@@ -43,11 +43,10 @@ from app.agent.storage import SessionStore, build_session_store
 from app.agent.state import AgentSessionState, Slots, build_chief_complaint_from_slots, build_summary_from_slots
 from app.privacy import redact_pii_for_llm
 from app.rag.evidence_policy import is_low_evidence, summarize_evidence_quality
-from app.safety.conflict_judge import judge_text_conflicts
-from app.safety.record_guard import (
-    apply_record_conflicts_to_answer_text,
-    build_record_summary_from_slots,
-    detect_record_conflicts,
+from app.safety.confirmed_constraints import build_confirmed_constraints
+from app.safety.medication_safety_guard import (
+    extract_medication_candidates_from_answer,
+    guard_medication_candidates,
 )
 
 
@@ -403,6 +402,139 @@ def _build_structured_questions(sess: AgentSessionState, user_message: str) -> T
         sess.asked_slots = sess.asked_slots[-100:]
 
     return ask_text, questions, next_questions
+
+
+def _record_confirmation_snapshot(sess: AgentSessionState) -> Dict[str, int]:
+    facts = list(sess.pending_record_facts or [])
+    return {
+        "pending_count": sum(1 for fact in facts if str(getattr(fact, "status", "") or "") == "pending"),
+        "confirmed_count": sum(1 for fact in facts if str(getattr(fact, "status", "") or "") == "confirmed"),
+        "rejected_count": sum(1 for fact in facts if str(getattr(fact, "status", "") or "") == "rejected"),
+    }
+
+
+def _first_pending_record_fact(sess: AgentSessionState):
+    for fact in sess.pending_record_facts or []:
+        if str(getattr(fact, "status", "") or "").strip() == "pending":
+            return fact
+    return None
+
+
+def _build_pending_confirmation_question(fact: Any) -> str:
+    fact_value = str(getattr(fact, "value", "") or "").strip()
+    return f"病历中提到你可能{fact_value}，这一条是否属实？"
+
+
+def _classify_pending_record_reply(user_message: str, fact: Any) -> Optional[str]:
+    msg = str(user_message or "").strip()
+    if not msg:
+        return None
+
+    compact = re.sub(r"[\s，。！？!?,；;：:]", "", msg)
+    fact_value = str(getattr(fact, "value", "") or "").strip()
+    fact_core = fact_value.replace("过敏", "").strip()
+
+    negative_cues = ("不是", "不属实", "没有", "并不", "不对", "否认", "没这回事", "不过敏")
+    if any(cue in compact for cue in negative_cues):
+        if fact_value and (fact_value in compact or fact_core in compact or "过敏" in compact):
+            return "rejected"
+        if compact in {"不是", "没有", "不对"}:
+            return "rejected"
+
+    if fact_value and fact_value in compact:
+        return "confirmed"
+    if fact_core and fact_core in compact and "过敏" in compact:
+        return "confirmed"
+    if compact in {"是", "是的", "对", "对的", "属实", "确实", "没错"}:
+        return "confirmed"
+    return None
+
+
+def _blank_rejected_allergy_from_patch(patch_slots: Slots, rejected_values: List[str]) -> Slots:
+    allergy_text = str(patch_slots.allergy or "").strip()
+    if not allergy_text:
+        return patch_slots
+
+    for value in rejected_values:
+        fact_value = str(value or "").strip()
+        fact_core = fact_value.replace("过敏", "").strip()
+        if fact_value and fact_value in allergy_text:
+            return patch_slots.model_copy(update={"allergy": ""})
+        if fact_core and fact_core in allergy_text:
+            return patch_slots.model_copy(update={"allergy": ""})
+    return patch_slots
+
+
+def _empty_record_admission_stats() -> Dict[str, int]:
+    return {"added": 0, "merged": 0, "skipped": 0}
+
+
+def _merge_record_admission_stats(left: Dict[str, int], right: Dict[str, int]) -> Dict[str, int]:
+    merged = dict(left)
+    for key in ("added", "merged", "skipped"):
+        merged[key] = int(merged.get(key, 0)) + int(right.get(key, 0))
+    return merged
+
+
+def _strip_answer_contract_sections(answer: str) -> str:
+    s = str(answer or "").strip()
+    s = re.sub(r"\n*引用[：:][^\n]*", "\n", s)
+    s = re.sub(r"\n*免责声明[：:][^\n]*", "\n", s)
+    return s.strip()
+
+
+def _split_answer_sentences(answer: str) -> List[str]:
+    parts = re.split(r"[\r\n。；;]+", str(answer or "").strip())
+    return [part.strip(" ，,") for part in parts if part.strip(" ，,")]
+
+
+def _build_guard_warning_lines(guard_result: Dict[str, Any]) -> List[str]:
+    warnings: List[str] = []
+    seen = set()
+
+    for conflict in guard_result.get("conflicts", []) or []:
+        source_fact_value = str(conflict.get("source_fact_value") or "").strip()
+        if source_fact_value:
+            line = f"你已确认{source_fact_value}，本轮已去除冲突用药建议。"
+        else:
+            line = "你已确认存在用药禁忌，本轮已去除冲突用药建议。"
+        if line not in seen:
+            seen.add(line)
+            warnings.append(line)
+
+    return warnings
+
+
+def _rewrite_answer_with_guard_result(original_answer: str, guard_result: Dict[str, Any]) -> str:
+    blocked_items = list(guard_result.get("blocked_medications", []) or [])
+    if not blocked_items:
+        return str(original_answer or "").strip()
+
+    blocked_texts = {str(item.get("text") or "").strip() for item in blocked_items if str(item.get("text") or "").strip()}
+    body = _strip_answer_contract_sections(original_answer)
+    kept_sentences = [sentence for sentence in _split_answer_sentences(body) if sentence not in blocked_texts]
+    warning_lines = _build_guard_warning_lines(guard_result)
+    rebuilt = warning_lines + kept_sentences
+    return "；".join([line for line in rebuilt if line]).strip("； ")
+
+
+def _apply_confirmed_medication_safety(state: AgentGraphState, sess: AgentSessionState, answer: str) -> str:
+    constraints = build_confirmed_constraints(sess.longitudinal_records)
+    candidates = extract_medication_candidates_from_answer(answer)
+    guard_result = guard_medication_candidates(candidates, constraints)
+
+    tr_any = state.get("trace")
+    tr = tr_any if isinstance(tr_any, dict) else {}
+    tr["medication_safety"] = {
+        "constraint_count": len(constraints),
+        "candidate_count": len(candidates),
+        "allowed_count": len(guard_result.get("allowed_medications", []) or []),
+        "blocked_count": len(guard_result.get("blocked_medications", []) or []),
+        "warning_count": len(guard_result.get("warnings", []) or []),
+    }
+    state["trace"] = cast(Dict[str, Any], tr)
+
+    return _rewrite_answer_with_guard_result(answer, guard_result)
 
 
 def _looks_like_red_flag(text: str) -> List[str]:
@@ -1009,7 +1141,24 @@ def _node_memory_update(state: AgentGraphState) -> Dict[str, Any]:
     # ===== 批次1新增：记录更新前的槽位 =====
     old_slots = sess.slots.model_dump()
 
+    confirmed_values: List[str] = []
+    rejected_values: List[str] = []
+    for fact in sess.pending_record_facts or []:
+        if str(getattr(fact, "status", "") or "").strip() != "pending":
+            continue
+        decision = _classify_pending_record_reply(msg, fact)
+        if decision == "confirmed":
+            fact.status = "confirmed"
+            confirmed_values.append(str(getattr(fact, "value", "") or "").strip())
+        elif decision == "rejected":
+            fact.status = "rejected"
+            rejected_values.append(str(getattr(fact, "value", "") or "").strip())
+
     patch_slots = _extract_slots_with_llm(msg)
+    if rejected_values:
+        patch_slots = _blank_rejected_allergy_from_patch(patch_slots, rejected_values)
+    if confirmed_values:
+        patch_slots = patch_slots.model_copy(update={"allergy": confirmed_values[0]})
 
     sess.slots = sess.slots.merge_from_partial(patch_slots)
 
@@ -1038,6 +1187,11 @@ def _node_memory_update(state: AgentGraphState) -> Dict[str, Any]:
     tr["slots_changed"] = slots_changed
     tr["record_admission"] = dict(record_admission)
     tr["record_admission"]["total_records"] = len(sess.longitudinal_records)
+    tr["record_confirmation"] = {
+        **_record_confirmation_snapshot(sess),
+        "newly_confirmed": len(confirmed_values),
+        "newly_rejected": len(rejected_values),
+    }
     state["trace"] = cast(Dict[str, Any], tr)
 
     _trace_end(state, node, t0)
@@ -1071,6 +1225,39 @@ def _node_triage_planner(state: AgentGraphState) -> Dict[str, Any]:
         "detected": is_kb,
         "confidence": kb_confidence,
     }
+
+    pending_fact = _first_pending_record_fact(sess)
+    if pending_fact is not None:
+        question = _build_pending_confirmation_question(pending_fact)
+        state["mode"] = "ask"
+        state["ask_text"] = "在继续给出建议前，我需要先确认一条安全信息。"
+        state["questions"] = [
+            {
+                "slot": "record_confirmation",
+                "question": question,
+                "type": "single_choice",
+                "choices": ["是", "否"],
+            }
+        ]
+        state["next_questions"] = [question]
+        state["answer"] = ""
+        state["citations"] = []
+        tr["planner_strategy"] = "record_confirmation"
+        tr["record_confirmation"] = {
+            **_record_confirmation_snapshot(sess),
+            "active_fact_id": str(getattr(pending_fact, "fact_id", "") or "").strip(),
+        }
+        state["trace"] = cast(Dict[str, Any], tr)
+        _trace_end(state, node, t0)
+        return {
+            "mode": state.get("mode"),
+            "ask_text": state.get("ask_text"),
+            "questions": state.get("questions"),
+            "next_questions": state.get("next_questions"),
+            "answer": state.get("answer"),
+            "citations": state.get("citations"),
+            "session": sess,
+        }
 
     if is_kb and kb_confidence >= 0.7:
         # 知识问答直达：不要求补全问诊槽位
@@ -1244,16 +1431,11 @@ def _node_answer_compose(state: AgentGraphState) -> Dict[str, Any]:
 
     if is_low_evidence(evidence_quality):
         ans = _build_low_evidence_answer(evidence)
-        conflicts = detect_record_conflicts(ans, sess.record_summary or build_record_summary_from_slots(sess.slots))
-        confirmed_conflicts, dismissed_conflicts = judge_text_conflicts(ans, conflicts)
-        if confirmed_conflicts:
-            ans = apply_record_conflicts_to_answer_text(ans, confirmed_conflicts)
-            ans = _ensure_answer_contract(ans, evidence)
+        ans = _apply_confirmed_medication_safety(state, sess, ans)
+        ans = _ensure_answer_contract(ans, evidence)
         tr_any = state.get("trace")
         tr = tr_any if isinstance(tr_any, dict) else {}
-        tr["record_conflicts"] = confirmed_conflicts
-        if dismissed_conflicts:
-            tr["record_conflicts_dismissed"] = dismissed_conflicts
+        tr["record_confirmation"] = _record_confirmation_snapshot(sess)
         state["trace"] = cast(Dict[str, Any], tr)
         sess.append_message("assistant", ans)
         state["citations"] = _citations_from_evidence(evidence)
@@ -1272,20 +1454,14 @@ def _node_answer_compose(state: AgentGraphState) -> Dict[str, Any]:
     text = _call_llm_text(ANSWER_SYSTEM, user_prompt)
     ans = (text or "").strip()
 
-    conflicts = detect_record_conflicts(ans, sess.record_summary or build_record_summary_from_slots(sess.slots))
-    confirmed_conflicts, dismissed_conflicts = judge_text_conflicts(ans, conflicts)
-    if confirmed_conflicts:
-        ans = apply_record_conflicts_to_answer_text(ans, confirmed_conflicts)
-
     citations = _citations_from_evidence(evidence)
+    ans = _apply_confirmed_medication_safety(state, sess, ans)
     ans = _ensure_answer_contract(ans, evidence)
     sess.append_message("assistant", ans)
     state["citations"] = citations
     tr_any = state.get("trace")
     tr = tr_any if isinstance(tr_any, dict) else {}
-    tr["record_conflicts"] = confirmed_conflicts
-    if dismissed_conflicts:
-        tr["record_conflicts_dismissed"] = dismissed_conflicts
+    tr["record_confirmation"] = _record_confirmation_snapshot(sess)
     state["trace"] = cast(Dict[str, Any], tr)
 
     _trace_end(state, node, t0)

@@ -42,13 +42,11 @@ def _install_fake_engine(monkeypatch):
     return triage_service
 
 
-def test_triage_once_with_clinical_record_filters_unsafe_drug_action(monkeypatch, tmp_path):
-    import app.safety.conflict_judge as conflict_judge
-
+def test_triage_once_does_not_apply_record_veto_from_clinical_record_path(monkeypatch, tmp_path):
     triage_service = _install_fake_engine(monkeypatch)
-    monkeypatch.setattr(conflict_judge, "_predict_conflict_scores", lambda premise, hypotheses: [0.95 for _ in hypotheses])
 
     record_path = tmp_path / "record.txt"
+    record_path.parent.mkdir(parents=True, exist_ok=True)
     record_path.write_text("过敏：青霉素过敏", encoding="utf-8")
 
     payload = triage_service.triage_once(
@@ -57,18 +55,15 @@ def test_triage_once_with_clinical_record_filters_unsafe_drug_action(monkeypatch
     )
 
     answer = payload["answer"]
-    assert answer["immediate_actions"] == []
-    assert "record_conflict" in answer["uncertainty"]
-    assert answer["record_conflicts"][0]["matched_term"] == "阿莫西林"
+    assert answer["immediate_actions"] == ["可先口服阿莫西林，每天三次。"]
+    assert answer.get("record_conflicts", []) == []
 
 
-def test_triage_once_records_record_conflicts_in_trace(monkeypatch, tmp_path):
-    import app.safety.conflict_judge as conflict_judge
-
+def test_triage_once_trace_marks_external_record_veto_as_disabled(monkeypatch, tmp_path):
     triage_service = _install_fake_engine(monkeypatch)
-    monkeypatch.setattr(conflict_judge, "_predict_conflict_scores", lambda premise, hypotheses: [0.95 for _ in hypotheses])
 
     record_path = tmp_path / "record.txt"
+    record_path.parent.mkdir(parents=True, exist_ok=True)
     record_path.write_text("过敏：青霉素过敏", encoding="utf-8")
 
     payload = triage_service.triage_once(
@@ -78,7 +73,7 @@ def test_triage_once_records_record_conflicts_in_trace(monkeypatch, tmp_path):
 
     trace = payload["meta"]["trace"]
     assert any(step.get("step") == "record.safety" for step in trace)
-    assert any(step.get("status") == "conflict" for step in trace if step.get("step") == "record.safety")
+    assert any(step.get("status") == "disabled_unconfirmed_source" for step in trace if step.get("step") == "record.safety")
 
 
 def test_triage_once_does_not_treat_negative_warning_fields_as_positive_conflict(monkeypatch, tmp_path):
@@ -109,6 +104,7 @@ def test_triage_once_does_not_treat_negative_warning_fields_as_positive_conflict
     monkeypatch.setattr(conflict_judge, "_predict_conflict_scores", lambda premise, hypotheses: [0.05 for _ in hypotheses])
 
     record_path = tmp_path / "record.txt"
+    record_path.parent.mkdir(parents=True, exist_ok=True)
     record_path.write_text("过敏：青霉素过敏", encoding="utf-8")
 
     payload = triage_service.triage_once(

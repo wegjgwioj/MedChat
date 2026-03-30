@@ -98,3 +98,30 @@ def test_graph_trace_uses_redis_store(monkeypatch):
 
     storage_meta = (out.get("trace") or {}).get("storage") or {}
     assert storage_meta["type"] == "redis"
+
+
+def test_session_store_roundtrip_preserves_pending_facts(tmp_path):
+    from app.agent.state import AgentSessionState
+    from app.agent.storage_sqlite import SqliteSessionStore
+
+    store = SqliteSessionStore(tmp_path / "agent_sessions.sqlite3")
+    sess = AgentSessionState(session_id="pending-1")
+    sess.pending_record_facts = [
+        {
+            "fact_id": "fact-1",
+            "category": "allergy",
+            "label": "过敏",
+            "value": "青霉素过敏",
+            "source_kind": "ocr",
+            "source_excerpt": "过敏史：青霉素",
+            "status": "pending",
+            "created_at": "2026-03-29T00:00:00Z",
+        }
+    ]
+
+    store.save_session(sess)
+    loaded = store.load_session("pending-1")
+
+    assert loaded is not None
+    assert loaded.pending_record_facts[0].value == "青霉素过敏"
+    assert loaded.pending_record_facts[0].status == "pending"

@@ -58,6 +58,8 @@ logger = logging.getLogger(__name__)
 
 _TRACE_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("trace_id", default=None)
 
+from app.agent.state import AgentSessionState, PendingRecordFact
+from app.agent.storage import build_session_store
 from app.agent.storage_sqlite import SqliteSessionStore
 
 _OCR_STORE = SqliteSessionStore()
@@ -105,7 +107,7 @@ class TriageRequest(BaseModel):
     mode: Literal["fast", "safe"] = Field("fast", description="fast更快；safe会跑安全审查链更慢更稳")
     clinical_record_path: Optional[str] = Field(
         None,
-        description="可选：病历/规则摘要文本路径（不强依赖；可留空）。",
+        description="可选：病历/规则摘要文本路径（仅作为未确认外部资料输入，不直接拥有即时用药否决权；可留空）。",
     )
 
 
@@ -277,6 +279,60 @@ def _session_file_path(session_id: str) -> Path:
 
 def _utc_now() -> str:
     return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _extract_pending_record_facts_from_ocr_text(task_id: str, text: str, source_kind: str) -> list[PendingRecordFact]:
+    clean = str(text or "").strip()
+    if not clean:
+        return []
+
+    facts: list[PendingRecordFact] = []
+    if "青霉素过敏" in clean or ("过敏" in clean and "青霉素" in clean):
+        facts.append(
+            PendingRecordFact(
+                fact_id=f"{task_id}:allergy:penicillin",
+                category="allergy",
+                label="过敏",
+                value="青霉素过敏",
+                source_kind=str(source_kind or "ocr"),
+                source_excerpt=clean[:120],
+                status="pending",
+            )
+        )
+    return facts
+
+
+def _write_pending_record_facts_to_agent_session(session_id: str, pending_facts: list[PendingRecordFact]) -> None:
+    facts = list(pending_facts or [])
+    if not facts:
+        return
+
+    store = build_session_store()
+    session = store.load_session(session_id) or AgentSessionState(session_id=session_id)
+    existing_keys = {
+        (
+            str(fact.category),
+            str(fact.value or "").strip(),
+            str(fact.source_kind or "").strip(),
+        )
+        for fact in (session.pending_record_facts or [])
+    }
+
+    changed = False
+    for fact in facts:
+        key = (
+            str(fact.category),
+            str(fact.value or "").strip(),
+            str(fact.source_kind or "").strip(),
+        )
+        if key in existing_keys:
+            continue
+        session.pending_record_facts.append(fact)
+        existing_keys.add(key)
+        changed = True
+
+    if changed:
+        store.save_session(session)
 
 
 def _load_or_create_session(session_id: str) -> Dict[str, Any]:
@@ -1430,6 +1486,9 @@ def ocr_status(
             vs.persist()
         except Exception:
             pass
+
+    pending_facts = _extract_pending_record_facts_from_ocr_text(task_id, clean, "ocr")
+    _write_pending_record_facts_to_agent_session(sid, pending_facts)
 
     _OCR_STORE.upsert_ocr_task(
         task_id=task_id,

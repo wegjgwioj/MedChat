@@ -187,3 +187,63 @@ def test_ocr_ingest_accepts_file_upload(monkeypatch, tmp_path: Path):
     assert rec is not None
     assert rec["source_kind"] == "upload"
     assert rec["source_name"] == "report.pdf"
+
+
+def test_ocr_status_writes_pending_record_fact_into_agent_session(monkeypatch, tmp_path):
+    import app.api_server as api_server
+    from app.agent.storage_sqlite import SqliteSessionStore
+
+    db_path = tmp_path / "agent_sessions.sqlite3"
+    store = SqliteSessionStore(db_path)
+    monkeypatch.setattr(api_server, "_OCR_STORE", store, raising=False)
+    monkeypatch.setenv("AGENT_SESSION_STORE", "sqlite")
+    monkeypatch.setenv("AGENT_SQLITE_DB_PATH", str(db_path))
+
+    store.upsert_ocr_task(
+        task_id="task-done-ocr-fact",
+        session_id="s-ocr",
+        source_url="https://example.com/report.pdf",
+        source_name="report.pdf",
+        source_kind="url",
+        status="pending",
+        trace_id="trace-ocr",
+    )
+
+    monkeypatch.setattr(
+        api_server,
+        "_get_mineru_task_status",
+        lambda task_id: {
+            "task_id": task_id,
+            "status": "done",
+            "done": True,
+            "trace_id": "trace-ocr",
+            "full_zip_url": "https://example.com/full.zip",
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(api_server, "_download_mineru_result_zip", lambda url: b"zip-bytes", raising=False)
+    monkeypatch.setattr(
+        api_server,
+        "_extract_mineru_text_from_zip",
+        lambda zip_bytes: ("过敏史：青霉素过敏。", {"picked": "result.md"}),
+        raising=False,
+    )
+
+    class FakeVS:
+        def add_documents(self, documents):
+            return None
+
+        def persist(self):
+            return None
+
+    monkeypatch.setattr(api_server, "_get_vectordb_for_ocr", lambda: FakeVS(), raising=False)
+
+    client = TestClient(api_server.app)
+    resp = client.get("/v1/ocr/status/task-done-ocr-fact")
+
+    session = store.load_session("s-ocr")
+    assert resp.status_code == 200
+    assert session is not None
+    assert session.pending_record_facts[0].value == "青霉素过敏"
+    assert session.pending_record_facts[0].status == "pending"
+    assert session.record_summary == ""

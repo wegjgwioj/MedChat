@@ -43,11 +43,7 @@ from app.agent.storage import SessionStore, build_session_store
 from app.agent.state import AgentSessionState, Slots, build_chief_complaint_from_slots, build_summary_from_slots
 from app.privacy import redact_pii_for_llm
 from app.rag.evidence_policy import is_low_evidence, summarize_evidence_quality
-from app.safety.confirmed_constraints import build_confirmed_constraints
-from app.safety.medication_safety_guard import (
-    extract_medication_candidates_from_answer,
-    guard_medication_candidates,
-)
+from app.safety import apply_confirmed_safety_fuse_to_text
 
 
 logger = logging.getLogger(__name__)
@@ -519,27 +515,38 @@ def _rewrite_answer_with_guard_result(original_answer: str, guard_result: Dict[s
 
 
 def _apply_confirmed_medication_safety(state: AgentGraphState, sess: AgentSessionState, answer: str) -> str:
-    constraints = build_confirmed_constraints(sess.longitudinal_records)
-    candidates = extract_medication_candidates_from_answer(answer)
-    guard_result = guard_medication_candidates(candidates, constraints)
+    body = _strip_answer_contract_sections(answer)
+    fused = apply_confirmed_safety_fuse_to_text(
+        answer_text=body,
+        longitudinal_records=sess.longitudinal_records,
+    )
+    fuse_trace = dict(fused.get("trace") or {})
 
     tr_any = state.get("trace")
     tr = tr_any if isinstance(tr_any, dict) else {}
-    blocked_count = len(guard_result.get("blocked_medications", []) or [])
+    safety_trace = {
+        "constraint_count": int(fuse_trace.get("constraint_count") or 0),
+        "candidate_count": int(fuse_trace.get("candidate_count") or 0),
+        "blocked_count": int(fuse_trace.get("blocked_count") or 0),
+        "warning_count": int(fuse_trace.get("warning_count") or 0),
+        "model_judge_used": bool(fuse_trace.get("model_judge_used") or False),
+        "rewrite_used": bool(fuse_trace.get("rewrite_used") or False),
+        "blocked_items": list(fuse_trace.get("blocked_items") or []),
+    }
+    tr["safety_fuse"] = safety_trace
     tr["medication_safety"] = {
-        "constraint_count": len(constraints),
-        "candidate_count": len(candidates),
-        "allowed_count": len(guard_result.get("allowed_medications", []) or []),
-        "blocked_count": blocked_count,
-        "warning_count": len(guard_result.get("warnings", []) or []),
-        "rule_checks": len(candidates),
-        "rule_blocked": blocked_count,
-        "model_judge_used": False,
+        **safety_trace,
+        "allowed_count": max(
+            int(fuse_trace.get("candidate_count") or 0) - int(fuse_trace.get("blocked_count") or 0),
+            0,
+        ),
+        "rule_checks": int(fuse_trace.get("candidate_count") or 0),
+        "rule_blocked": int(fuse_trace.get("blocked_count") or 0),
         "model_confirmed": 0,
     }
     state["trace"] = cast(Dict[str, Any], tr)
 
-    return _rewrite_answer_with_guard_result(answer, guard_result)
+    return str(fused.get("answer") or "").strip()
 
 
 def _looks_like_red_flag(text: str) -> List[str]:

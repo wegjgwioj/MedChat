@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 _TRACE_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("trace_id", default=None)
 
-from app.agent.state import AgentSessionState, PendingRecordFact
+from app.agent.state import AgentSessionState, LongitudinalRecordFact, PendingRecordFact
 from app.agent.storage import build_session_store
 from app.agent.storage_sqlite import SqliteSessionStore
 from app.privacy import redact_pii_for_llm
@@ -334,6 +334,22 @@ def _write_pending_record_facts_to_agent_session(session_id: str, pending_facts:
 
     if changed:
         store.save_session(session)
+
+
+def _load_confirmed_longitudinal_records(session_id: str) -> list[LongitudinalRecordFact]:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return []
+
+    try:
+        session = build_session_store().load_session(sid)
+    except Exception as e:
+        logger.warning("加载 confirmed longitudinal records 失败: %s", e)
+        return []
+
+    if not isinstance(session, AgentSessionState):
+        return []
+    return list(session.longitudinal_records or [])
 
 
 def _load_or_create_session(session_id: str) -> Dict[str, Any]:
@@ -832,6 +848,7 @@ class _ChatGraphState(TypedDict, total=False):
     turns_len: int
     intake_slots: Dict[str, Any]
     inquiry_state: Dict[str, Any]
+    longitudinal_records: list
 
     greeting_only: bool
     handled_reply: bool
@@ -1076,6 +1093,9 @@ def _get_chat_graph():
         answer_json = state.get("answer_json")
         if not isinstance(answer_json, dict):
             answer_json = {}
+        longitudinal_records = state.get("longitudinal_records")
+        if not isinstance(longitudinal_records, list):
+            longitudinal_records = []
         mode = str(state.get("mode") or "safe").strip().lower()
         forced_safe = bool(state.get("forced_safe") or False)
         rag_status = str(state.get("rag_status") or "unknown")
@@ -1094,6 +1114,7 @@ def _get_chat_graph():
             rag_status=rag_status,
             rag_error=rag_error,
             trace=trace,
+            longitudinal_records=longitudinal_records,
         )
 
         trace = _append_chat_trace(trace, "BUILD_PAYLOAD", "ok", t0)
@@ -1720,6 +1741,7 @@ def chat(
         inquiry_state = {}
 
     allow_save_raw = _env_flag("ALLOW_SAVE_SESSION_RAW_TEXT", "0")
+    longitudinal_records = _load_confirmed_longitudinal_records(session_id)
 
     client_host = request.client.host if request.client else None
     final_mode, forced_safe = _apply_mode_policy(req.mode, client_host)
@@ -1735,6 +1757,7 @@ def chat(
         "turns_len": len(turns),
         "intake_slots": intake_slots,
         "inquiry_state": inquiry_state,
+        "longitudinal_records": longitudinal_records,
         "triage_trace": [],
     }
     result = graph.invoke(gstate)

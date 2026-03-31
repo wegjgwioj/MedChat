@@ -45,6 +45,11 @@ except Exception:
     from safety.conflict_judge import judge_json_conflicts  # type: ignore
 
 try:
+    from .safety.safety_fuse import apply_confirmed_safety_fuse_to_triage_answer  # type: ignore
+except Exception:
+    from safety.safety_fuse import apply_confirmed_safety_fuse_to_triage_answer  # type: ignore
+
+try:
     # 你的项目里已有 rag/retriever.py
     from .rag import retriever as rag_retriever  # type: ignore
     from .rag.evidence_policy import is_low_evidence, summarize_evidence_quality  # type: ignore
@@ -208,27 +213,51 @@ def _append_uncertainty_tag(text: str, tag: str) -> str:
     return " | ".join(parts)
 
 
-def _apply_record_safety(answer_json: Dict[str, Any], clinical_record_text: str, trace: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def _apply_record_safety(
+    answer_json: Dict[str, Any],
+    clinical_record_text: str,
+    longitudinal_records: Optional[List[Any]] = None,
+    trace: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     if trace is None:
         trace = []
 
+    longitudinal_records = list(longitudinal_records or [])
     record_text = str(clinical_record_text or "").strip()
-    if not record_text:
-        return answer_json
+    fused = apply_confirmed_safety_fuse_to_triage_answer(
+        answer_json=answer_json,
+        longitudinal_records=longitudinal_records,
+    )
+    fuse_trace = dict(fused.get("trace") or {})
+    out = dict(answer_json if isinstance(answer_json, dict) else {})
+
+    if longitudinal_records:
+        out = dict(fused.get("answer_json") or {})
+        status = "blocked" if int(fuse_trace.get("blocked_count") or 0) > 0 else "clear"
+    elif record_text:
+        status = "disabled_unconfirmed_source"
+    else:
+        status = "skipped_no_confirmed_records"
 
     trace.append(
         {
             "step": "record.safety",
-            "status": "disabled_unconfirmed_source",
-            "reason": "clinical_record_path requires in-dialog confirmation",
-            "rule_checks": 0,
-            "rule_blocked": 0,
-            "model_judge_used": False,
+            "status": status,
+            "reason": "clinical_record_path requires in-dialog confirmation" if (record_text and not longitudinal_records) else "",
+            "constraint_count": int(fuse_trace.get("constraint_count") or 0),
+            "candidate_count": int(fuse_trace.get("candidate_count") or 0),
+            "blocked_count": int(fuse_trace.get("blocked_count") or 0),
+            "warning_count": int(fuse_trace.get("warning_count") or 0),
+            "rule_checks": int(fuse_trace.get("candidate_count") or 0),
+            "rule_blocked": int(fuse_trace.get("blocked_count") or 0),
+            "model_judge_used": bool(fuse_trace.get("model_judge_used") or False),
             "model_confirmed": 0,
+            "rewrite_used": bool(fuse_trace.get("rewrite_used") or False),
+            "blocked_items": list(fuse_trace.get("blocked_items") or []),
         }
     )
-    out = dict(answer_json if isinstance(answer_json, dict) else {})
-    out["record_conflicts"] = []
+    if not longitudinal_records:
+        out["record_conflicts"] = []
     return out
 
 
@@ -918,8 +947,6 @@ class TriageEngine:
                 trace=trace,
             )
 
-        answer_json = _apply_record_safety(answer_json, clinical_record_text, trace=trace)
-
         created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         return TriageResult(
             answer_json=answer_json,
@@ -942,6 +969,7 @@ def triage_once(
     top_k: int = 5,
     mode: str = "fast",
     clinical_record_path: Optional[str] = None,
+    longitudinal_records: Optional[List[Any]] = None,
 ) -> Dict[str, Any]:
     """
     供FastAPI调用的轻量函数包装，返回可直接json序列化的dict。
@@ -963,26 +991,18 @@ def triage_once(
         clinical_record_text=clinical_record_text,
     )
 
-    payload = build_triage_payload(
-        answer=result.answer_json,
-        evidence=result.evidence,
+    return triage_step_build_payload(
+        answer_json=result.answer_json,
+        evidence_list=result.evidence,
         rag_query=result.rag_query,
         mode=result.mode,
         created_at=result.created_at,
+        rag_status=result.rag_status,
+        rag_error=result.rag_error,
+        trace=result.trace,
+        longitudinal_records=longitudinal_records,
+        clinical_record_text=clinical_record_text,
     )
-
-    # 可观测性：RAG状态回传（不影响 canonical payload 顶层结构）
-    meta = payload.get("meta")
-    if isinstance(meta, dict):
-        meta["rag_status"] = result.rag_status
-        meta["evidence_quality"] = summarize_evidence_quality(result.evidence)
-        if isinstance(result.rag_error, dict) and result.rag_error:
-            meta["rag_error"] = result.rag_error
-        # 可观测性：工具化步骤轨迹（不包含原始文本）
-        if isinstance(result.trace, list) and result.trace:
-            meta["trace"] = result.trace
-
-    return payload
 
 
 def build_rag_query(user_text: str, clinical_record_text: str = "") -> str:
@@ -1072,11 +1092,22 @@ def triage_step_build_payload(
     rag_status: str = "unknown",
     rag_error: Optional[Dict[str, str]] = None,
     trace: Optional[List[Dict[str, Any]]] = None,
+    longitudinal_records: Optional[List[Any]] = None,
+    clinical_record_text: str = "",
 ) -> Dict[str, Any]:
     """Step 4: build canonical payload and attach observability meta."""
 
+    if trace is None:
+        trace = []
+    safe_answer = _apply_record_safety(
+        answer_json,
+        clinical_record_text,
+        longitudinal_records=longitudinal_records,
+        trace=trace,
+    )
+
     payload = build_triage_payload(
-        answer=answer_json,
+        answer=safe_answer,
         evidence=evidence_list,
         rag_query=rag_query,
         mode=mode,

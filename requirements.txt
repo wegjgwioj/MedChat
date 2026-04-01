@@ -11,6 +11,7 @@ langgraph==0.0.20
 
 # Local RAG (Faiss-HNSW + embeddings)
 faiss-cpu==1.13.2
+opensearch-py==2.8.0
 sentence-transformers==2.6.1
 transformers==4.36.2
 BCEmbedding>=0.1.5  # Required for embedding & reranking (maidalun1020/bce-embedding-base_v1)

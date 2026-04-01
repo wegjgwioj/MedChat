@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """rag_core.py
 
-M1：RAGService 核心实现（Faiss-HNSW 版本）。
+M1：README 对齐后的 OpenSearch hybrid retrieval 核心实现。
 
 目标：
-- 统一入库与检索的 embedding 配置（默认 BCEmbedding bce-embedding-base_v1，GPU 优先）。
-- 两阶段检索：Faiss-HNSW dense 召回 top_n -> 可选 BCEmbedding reranker 重排 -> 返回 top_k。
-- 固定 evidence 契约：retrieve() 返回 List[Dict] 且字段齐全，可直接被 triage_service.py 使用。
+- 统一入库与检索的 embedding 配置（默认 BCE embedding，GPU 优先）。
+- 执行 OpenSearch 的 BM25 + dense vector hybrid 检索，并可选 rerank。
+- 固定 evidence 契约：retrieve() 返回 List[Dict] 且字段齐全，可直接被 agent 主链路使用。
 
 说明：
 - 该模块不依赖会话上下文，不会保存或输出用户历史文本。
@@ -27,7 +27,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.rag.cache_redis import RedisSemanticCache
-from app.rag.faiss_store import FaissHNSWStore
 from app.rag.opensearch_store import OpenSearchConfig, OpenSearchHybridStore
 
 from app.rag.utils.rag_shared import (
@@ -174,10 +173,10 @@ def _env_top_n_default() -> int:
 
 
 def _env_backend() -> str:
-    backend = (env_str("RAG_BACKEND", "") or "faiss").strip().lower()
-    if backend in {"opensearch", "open-search"}:
+    backend = (env_str("RAG_BACKEND", "") or "opensearch").strip().lower()
+    if not backend or backend in {"opensearch", "open-search"}:
         return "opensearch"
-    return "faiss"
+    raise RuntimeError("README 对齐后检索仅支持 OpenSearch，请移除 faiss 等非 OpenSearch 后端配置。")
 
 
 def _env_hybrid_mode() -> str:
@@ -425,7 +424,7 @@ def _load_sparse_docs(*, department: Optional[str] = None) -> List[_DocLike]:
     where = {"department": dept} if dept else None
     result = vs.get_documents(where=where)
     if not isinstance(result, dict):
-        raise RuntimeError("Faiss store.get_documents 返回格式非法。")
+        raise RuntimeError("向量检索后端返回了非法文档格式。")
 
     documents = list(result.get("documents") or [])
     metadatas = list(result.get("metadatas") or [])
@@ -749,26 +748,8 @@ def get_reranker() -> Optional[Any]:
         return _cached_reranker
 
 
-def get_vectordb() -> FaissHNSWStore:
-    """获取 Faiss-HNSW 向量库对象（单例缓存）。"""
-    global _cached_vs
-    if _cached_vs is not None:
-        return _cached_vs
-
-    with _vs_lock:
-        if _cached_vs is not None:
-            return _cached_vs
-
-        app_dir = resolve_app_dir(Path(__file__))
-        persist_dir = resolve_persist_dir(app_dir)
-        collection_name = env_str("RAG_COLLECTION", "") or DEFAULT_COLLECTION
-        embeddings, _ = get_embedder()
-        _cached_vs = FaissHNSWStore(
-            persist_dir=persist_dir,
-            embedding_function=embeddings,
-            collection_name=collection_name,
-        )
-        return _cached_vs
+def get_vectordb() -> Any:
+    raise RuntimeError("README 对齐后检索仅支持 OpenSearch，不再提供本地向量库后端。")
 
 
 def get_opensearch_store() -> OpenSearchHybridStore:
@@ -956,7 +937,7 @@ def retrieve(
     """对外统一检索入口。
 
     兼容性：
-    - 保持 `retrieve(query, top_k=5)` 可用，以兼容 triage_service.py 的现有调用。
+    - 保持 `retrieve(query, top_k=5)` 这一调用形式稳定，供当前 agent 主链路直接调用。
     """
     q = (query or "").strip()
     if not q:
@@ -979,13 +960,13 @@ def retrieve(
         search_q = _rewrite_query_slimming(q)
     # =============================
 
+    backend = _env_backend()
     k = int(top_k) if top_k and int(top_k) > 0 else 5
     n = int(top_n) if top_n is not None else _env_top_n_default()
     if n < k:
         n = k
     do_rerank = _env_use_reranker() if use_rerank is None else bool(use_rerank)
     hybrid_enabled = _env_hybrid_enabled()
-    backend = _env_backend()
     normalized_query = _normalize_query_for_cache(search_q)
     query_tokens = tuple(_tokenize_text(search_q))
     request_key = _build_cache_request_key(
@@ -1009,24 +990,6 @@ def retrieve(
         "sparse_hits": 0,
     }
 
-    if backend == "faiss":
-        try:
-            vs = get_vectordb()
-            if int(vs.count()) <= 0:
-                empty_meta = dict(base_meta)
-                empty_meta.update(
-                    {
-                        "cache_hit": False,
-                        "cache_mode": None,
-                        "cache_backend": "redis" if _env_cache_enabled() else None,
-                        "hits": 0,
-                    }
-                )
-                _set_last_retrieval_meta(empty_meta)
-                return []
-        except Exception:
-            pass
-
     cached_items, cache_meta = _lookup_cache(
         normalized_query=normalized_query,
         query_tokens=query_tokens,
@@ -1039,100 +1002,37 @@ def retrieve(
         _set_last_retrieval_meta(hit_meta)
         return cached_items
 
-    if backend == "opensearch":
-        embeddings, _ = get_embedder()
-        if hasattr(embeddings, "embed_query"):
-            query_vector = list(embeddings.embed_query(search_q))
-        else:
-            query_vector = list((embeddings.embed_documents([search_q]) or [[0.0]])[0])
+    embeddings, _ = get_embedder()
+    if hasattr(embeddings, "embed_query"):
+        query_vector = list(embeddings.embed_query(search_q))
+    else:
+        query_vector = list((embeddings.embed_documents([search_q]) or [[0.0]])[0])
 
-        response = get_opensearch_store().search_hybrid(
-            query=search_q,
-            query_vector=query_vector,
-            top_k=n,
-            department=(department or "").strip() or None,
-        )
-        response_hits = list(response.get("hits") or [])
-        response_meta = dict(response.get("meta") or {})
+    response = get_opensearch_store().search_hybrid(
+        query=search_q,
+        query_vector=query_vector,
+        top_k=n,
+        department=(department or "").strip() or None,
+    )
+    response_hits = list(response.get("hits") or [])
+    response_meta = dict(response.get("meta") or {})
 
-        items = []
-        for i, hit in enumerate(response_hits, start=1):
-            item = _normalize_opensearch_hit(idx=i, hit=hit)
-            if not str(item.get("text") or "").strip():
-                continue
-            items.append(item)
-
-        base_meta["dense_hits"] = int(response_meta.get("knn_hits") or len(response_hits))
-        base_meta["sparse_hits"] = int(response_meta.get("bm25_hits") or len(response_hits))
-
-        if do_rerank and items:
-            items = _apply_rerank(q, items)
-        items = _apply_score_thresholds(items, use_rerank=do_rerank)
-        items = items[:k]
-        for i, item in enumerate(items, start=1):
-            item["eid"] = f"E{i}"
-
-        _store_cache(
-            normalized_query=normalized_query,
-            query_tokens=query_tokens,
-            request_key=request_key,
-            items=items,
-        )
-        miss_meta = dict(base_meta)
-        miss_meta.update(cache_meta)
-        miss_meta.update(
-            {
-                "cache_hit": False,
-                "cache_mode": None,
-                "hits": len(items),
-                "bm25_hits": int(response_meta.get("bm25_hits") or 0),
-                "knn_hits": int(response_meta.get("knn_hits") or 0),
-                "fusion_hits": int(response_meta.get("fusion_hits") or len(items)),
-                "hybrid_mode": str(response_meta.get("hybrid_mode") or _env_hybrid_mode()),
-                "index_name": str(response_meta.get("index_name") or _env_opensearch_index()),
-                "took_ms": int(response_meta.get("took_ms") or 0),
-            }
-        )
-        _set_last_retrieval_meta(miss_meta)
-        return items
-
-    dense_docs_scores = _vector_search(search_q, top_n=n, department=department)
-    dense_items: List[Dict[str, Any]] = []
-    for i, (doc, score) in enumerate(dense_docs_scores, start=1):
-        it = _normalize_evidence_item(idx=i, doc=doc, score=float(score) if score is not None else score)
-        if not str(it.get("text") or "").strip():
+    items: List[Dict[str, Any]] = []
+    for i, hit in enumerate(response_hits, start=1):
+        item = _normalize_opensearch_hit(idx=i, hit=hit)
+        if not str(item.get("text") or "").strip():
             continue
-        it["hybrid_dense_score"] = float(it.get("score") or 0.0)
-        dense_items.append(it)
+        items.append(item)
 
-    sparse_items: List[Dict[str, Any]] = []
-    if hybrid_enabled:
-        sparse_docs_scores = _sparse_search(search_q, top_n=n, department=department)
-        for i, (doc, sparse_score) in enumerate(sparse_docs_scores, start=1):
-            it = _normalize_evidence_item(idx=i, doc=doc, score=0.0)
-            if not str(it.get("text") or "").strip():
-                continue
-            it["hybrid_dense_score"] = 1.0
-            it["hybrid_sparse_score"] = float(sparse_score)
-            sparse_items.append(it)
-        base_meta["sparse_hits"] = len(sparse_items)
+    base_meta["dense_hits"] = int(response_meta.get("knn_hits") or len(response_hits))
+    base_meta["sparse_hits"] = int(response_meta.get("bm25_hits") or len(response_hits))
 
-    base_meta["dense_hits"] = len(dense_items)
-
-    items = _merge_hybrid_candidates(dense_items=dense_items, sparse_items=sparse_items)
-    items = _apply_hybrid_ranking(search_q, items)
     if do_rerank and items:
-        # 重排建议使用原句 q，因为精排模型需要上下文
         items = _apply_rerank(q, items)
-
     items = _apply_score_thresholds(items, use_rerank=do_rerank)
-
-    # 截断 top_k，并重建 eid 连续
     items = items[:k]
-    for i, it in enumerate(items, start=1):
-        it["eid"] = f"E{i}"
-        it.pop("hybrid_dense_score", None)
-        it.pop("hybrid_sparse_score", None)
+    for i, item in enumerate(items, start=1):
+        item["eid"] = f"E{i}"
 
     _store_cache(
         normalized_query=normalized_query,
@@ -1142,60 +1042,40 @@ def retrieve(
     )
     miss_meta = dict(base_meta)
     miss_meta.update(cache_meta)
-    miss_meta.update({"cache_hit": False, "cache_mode": None, "hits": len(items)})
+    miss_meta.update(
+        {
+            "cache_hit": False,
+            "cache_mode": None,
+            "hits": len(items),
+            "bm25_hits": int(response_meta.get("bm25_hits") or 0),
+            "knn_hits": int(response_meta.get("knn_hits") or 0),
+            "fusion_hits": int(response_meta.get("fusion_hits") or len(items)),
+            "hybrid_mode": str(response_meta.get("hybrid_mode") or _env_hybrid_mode()),
+            "index_name": str(response_meta.get("index_name") or _env_opensearch_index()),
+            "took_ms": int(response_meta.get("took_ms") or 0),
+        }
+    )
     _set_last_retrieval_meta(miss_meta)
     return items
 
 
 def get_stats() -> RagStats:
     """返回当前 RAG 底座状态。"""
+    _env_backend()
     _, emb_info = get_embedder()
     rerank_model = _env_rerank_model() if _env_use_reranker() else None
-
-    if _env_backend() == "opensearch":
-        store = get_opensearch_store()
-        try:
-            count = int(store.count())
-        except Exception:
-            count = 0
-        return RagStats(
-            backend="opensearch",
-            collection=str(store.config.index_name),
-            count=count,
-            persist_dir=str(store.config.url),
-            device=str((emb_info.device if emb_info else "") or resolve_embedding_device()),
-            embed_model=str((emb_info.model_name if emb_info else "") or _env_embed_model_default()),
-            rerank_model=rerank_model,
-            updated_at="",
-        )
-
-    vs = get_vectordb()
-
-    app_dir = resolve_app_dir(Path(__file__))
-    persist_dir = resolve_persist_dir(app_dir)
-    collection_name = env_str("RAG_COLLECTION", "") or DEFAULT_COLLECTION
-
+    store = get_opensearch_store()
     try:
-        count = int(vs.count())
+        count = int(store.count())
     except Exception:
         count = 0
-
-    backend = getattr(vs, "backend_name", "faiss-hnsw")
-    updated_at = ""
-    try:
-        ts = float(getattr(vs, "updated_at", lambda: 0.0)())
-        if ts > 0:
-            updated_at = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        updated_at = ""
-
     return RagStats(
-        backend=str(backend),
-        collection=collection_name,
+        backend="opensearch",
+        collection=str(store.config.index_name),
         count=count,
-        persist_dir=str(persist_dir),
-        device=str(emb_info.device or resolve_embedding_device()),
-        embed_model=str(emb_info.model_name),
+        persist_dir=str(store.config.url),
+        device=str((emb_info.device if emb_info else "") or resolve_embedding_device()),
+        embed_model=str((emb_info.model_name if emb_info else "") or _env_embed_model_default()),
         rerank_model=rerank_model,
-        updated_at=updated_at,
+        updated_at="",
     )

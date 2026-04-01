@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.rag.cache_redis import RedisSemanticCache
 from app.rag.faiss_store import FaissHNSWStore
+from app.rag.opensearch_store import OpenSearchConfig, OpenSearchHybridStore
 
 from app.rag.utils.rag_shared import (
     DEFAULT_COLLECTION,
@@ -71,6 +72,7 @@ _runtime_lock = threading.Lock()
 _cached_embed: Optional[Tuple[Any, EmbeddingInfo]] = None
 _cached_reranker: Optional[Any] = None
 _cached_vs: Optional[Any] = None
+_cached_opensearch: Optional[OpenSearchHybridStore] = None
 _cache_backend: Optional[RedisSemanticCache] = None
 _last_retrieval_meta: Dict[str, Any] = {}
 
@@ -171,6 +173,17 @@ def _env_top_n_default() -> int:
     return max(1, int(n))
 
 
+def _env_backend() -> str:
+    backend = (env_str("RAG_BACKEND", "") or "faiss").strip().lower()
+    if backend in {"opensearch", "open-search"}:
+        return "opensearch"
+    return "faiss"
+
+
+def _env_hybrid_mode() -> str:
+    return (env_str("RAG_HYBRID_MODE", "") or "app_rrf").strip() or "app_rrf"
+
+
 def _env_float(name: str, default: float = 0.0) -> float:
     raw = env_str(name, "").strip()
     if not raw:
@@ -212,6 +225,47 @@ def _env_hybrid_token_min_len() -> int:
     return max(1, int(value))
 
 
+def _env_opensearch_url() -> str:
+    return env_str("OPENSEARCH_URL", "").strip()
+
+
+def _env_opensearch_index() -> str:
+    return (env_str("OPENSEARCH_INDEX", "") or env_str("RAG_COLLECTION", "") or DEFAULT_COLLECTION).strip()
+
+
+def _env_opensearch_username() -> str:
+    return env_str("OPENSEARCH_USERNAME", "").strip()
+
+
+def _env_opensearch_password() -> str:
+    return env_str("OPENSEARCH_PASSWORD", "").strip()
+
+
+def _env_opensearch_verify_ssl() -> bool:
+    return env_flag("OPENSEARCH_VERIFY_SSL", default="0")
+
+
+def _env_opensearch_vector_dim() -> int:
+    value = env_int("OPENSEARCH_VECTOR_DIM", default=768)
+    if not value:
+        return 768
+    return max(1, int(value))
+
+
+def _env_opensearch_knn_k() -> int:
+    value = env_int("OPENSEARCH_KNN_K", default=_env_top_n_default())
+    if not value:
+        return _env_top_n_default()
+    return max(1, int(value))
+
+
+def _env_opensearch_num_candidates() -> int:
+    value = env_int("OPENSEARCH_NUM_CANDIDATES", default=128)
+    if not value:
+        return 128
+    return max(1, int(value))
+
+
 def _env_cache_enabled() -> bool:
     return env_flag("RAG_CACHE_ENABLED", default="0")
 
@@ -238,7 +292,7 @@ def _env_cache_sim_threshold() -> float:
 def clear_runtime_state() -> None:
     """Reset module runtime caches for tests and local debugging."""
 
-    global _cached_embed, _cached_reranker, _cached_vs
+    global _cached_embed, _cached_reranker, _cached_vs, _cached_opensearch
     global _cache_backend, _last_retrieval_meta
 
     with _embed_lock:
@@ -247,6 +301,7 @@ def clear_runtime_state() -> None:
         _cached_reranker = None
     with _vs_lock:
         _cached_vs = None
+        _cached_opensearch = None
     with _cache_lock:
         _cache_backend = None
     with _runtime_lock:
@@ -505,12 +560,14 @@ def _build_cache_request_key(
     vector_max_score = _env_vector_max_score()
     return "|".join(
         [
-            "v2",
+            "v3",
+            f"backend={_env_backend()}",
             f"top_k={top_k}",
             f"top_n={top_n}",
             f"dept={dept}",
             f"use_rerank={int(use_rerank)}",
             f"hybrid={int(hybrid_enabled)}",
+            f"hybrid_mode={_env_hybrid_mode()}",
             f"hybrid_alpha={_env_hybrid_alpha():.3f}",
             f"rerank_min={_env_rerank_min_score():.3f}",
             f"vector_max={'' if vector_max_score is None else f'{vector_max_score:.3f}'}",
@@ -714,6 +771,35 @@ def get_vectordb() -> FaissHNSWStore:
         return _cached_vs
 
 
+def get_opensearch_store() -> OpenSearchHybridStore:
+    global _cached_opensearch
+    if _cached_opensearch is not None:
+        return _cached_opensearch
+
+    with _vs_lock:
+        if _cached_opensearch is not None:
+            return _cached_opensearch
+
+        url = _env_opensearch_url()
+        if not url:
+            raise RuntimeError("已启用 OpenSearch 检索，但未配置 OPENSEARCH_URL。")
+
+        _cached_opensearch = OpenSearchHybridStore(
+            OpenSearchConfig(
+                url=url,
+                index_name=_env_opensearch_index(),
+                vector_dim=_env_opensearch_vector_dim(),
+                username=_env_opensearch_username(),
+                password=_env_opensearch_password(),
+                verify_ssl=_env_opensearch_verify_ssl(),
+                knn_k=_env_opensearch_knn_k(),
+                num_candidates=_env_opensearch_num_candidates(),
+                hybrid_mode=_env_hybrid_mode(),
+            )
+        )
+        return _cached_opensearch
+
+
 def _vector_search(
     query: str,
     *,
@@ -776,6 +862,24 @@ def _normalize_evidence_item(
             "source_file": source_file,
         },
     }
+
+
+def _normalize_opensearch_hit(*, idx: int, hit: Dict[str, Any]) -> Dict[str, Any]:
+    source = dict(hit.get("_source") or {})
+    doc = _DocLike(
+        page_content=str(source.get("text") or "").strip(),
+        metadata=source,
+    )
+    score = hit.get("_score")
+    item = _normalize_evidence_item(
+        idx=idx,
+        doc=doc,
+        score=float(score) if isinstance(score, (int, float)) else 0.0,
+    )
+    explanation_meta = hit.get("_explanation_meta")
+    if isinstance(explanation_meta, dict):
+        item["retrieval_meta"] = dict(explanation_meta)
+    return item
 
 
 def _apply_rerank(query: str, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -863,31 +967,10 @@ def retrieve(
                 "cache_mode": None,
                 "cache_backend": "redis" if _env_cache_enabled() else None,
                 "hybrid_enabled": _env_hybrid_enabled(),
+                "backend": _env_backend(),
             }
         )
         return []
-
-    try:
-        vs = get_vectordb()
-        if int(vs.count()) <= 0:
-            _set_last_retrieval_meta(
-                {
-                    "query": q,
-                    "search_query": q,
-                    "top_k": int(top_k) if top_k and int(top_k) > 0 else 5,
-                    "top_n": int(top_n) if top_n is not None else _env_top_n_default(),
-                    "department": (department or "").strip(),
-                    "use_rerank": _env_use_reranker() if use_rerank is None else bool(use_rerank),
-                    "hybrid_enabled": _env_hybrid_enabled(),
-                    "cache_hit": False,
-                    "cache_mode": None,
-                    "cache_backend": "redis" if _env_cache_enabled() else None,
-                    "hits": 0,
-                }
-            )
-            return []
-    except Exception:
-        pass
 
     # === [M1 检索优化：触发瘦身逻辑] ===
     # 策略：长度超过 15 个字才瘦身，短句直接检索
@@ -902,6 +985,7 @@ def retrieve(
         n = k
     do_rerank = _env_use_reranker() if use_rerank is None else bool(use_rerank)
     hybrid_enabled = _env_hybrid_enabled()
+    backend = _env_backend()
     normalized_query = _normalize_query_for_cache(search_q)
     query_tokens = tuple(_tokenize_text(search_q))
     request_key = _build_cache_request_key(
@@ -920,9 +1004,28 @@ def retrieve(
         "department": (department or "").strip(),
         "use_rerank": do_rerank,
         "hybrid_enabled": hybrid_enabled,
+        "backend": backend,
         "dense_hits": 0,
         "sparse_hits": 0,
     }
+
+    if backend == "faiss":
+        try:
+            vs = get_vectordb()
+            if int(vs.count()) <= 0:
+                empty_meta = dict(base_meta)
+                empty_meta.update(
+                    {
+                        "cache_hit": False,
+                        "cache_mode": None,
+                        "cache_backend": "redis" if _env_cache_enabled() else None,
+                        "hits": 0,
+                    }
+                )
+                _set_last_retrieval_meta(empty_meta)
+                return []
+        except Exception:
+            pass
 
     cached_items, cache_meta = _lookup_cache(
         normalized_query=normalized_query,
@@ -935,6 +1038,63 @@ def retrieve(
         hit_meta["hits"] = len(cached_items)
         _set_last_retrieval_meta(hit_meta)
         return cached_items
+
+    if backend == "opensearch":
+        embeddings, _ = get_embedder()
+        if hasattr(embeddings, "embed_query"):
+            query_vector = list(embeddings.embed_query(search_q))
+        else:
+            query_vector = list((embeddings.embed_documents([search_q]) or [[0.0]])[0])
+
+        response = get_opensearch_store().search_hybrid(
+            query=search_q,
+            query_vector=query_vector,
+            top_k=n,
+            department=(department or "").strip() or None,
+        )
+        response_hits = list(response.get("hits") or [])
+        response_meta = dict(response.get("meta") or {})
+
+        items = []
+        for i, hit in enumerate(response_hits, start=1):
+            item = _normalize_opensearch_hit(idx=i, hit=hit)
+            if not str(item.get("text") or "").strip():
+                continue
+            items.append(item)
+
+        base_meta["dense_hits"] = int(response_meta.get("knn_hits") or len(response_hits))
+        base_meta["sparse_hits"] = int(response_meta.get("bm25_hits") or len(response_hits))
+
+        if do_rerank and items:
+            items = _apply_rerank(q, items)
+        items = _apply_score_thresholds(items, use_rerank=do_rerank)
+        items = items[:k]
+        for i, item in enumerate(items, start=1):
+            item["eid"] = f"E{i}"
+
+        _store_cache(
+            normalized_query=normalized_query,
+            query_tokens=query_tokens,
+            request_key=request_key,
+            items=items,
+        )
+        miss_meta = dict(base_meta)
+        miss_meta.update(cache_meta)
+        miss_meta.update(
+            {
+                "cache_hit": False,
+                "cache_mode": None,
+                "hits": len(items),
+                "bm25_hits": int(response_meta.get("bm25_hits") or 0),
+                "knn_hits": int(response_meta.get("knn_hits") or 0),
+                "fusion_hits": int(response_meta.get("fusion_hits") or len(items)),
+                "hybrid_mode": str(response_meta.get("hybrid_mode") or _env_hybrid_mode()),
+                "index_name": str(response_meta.get("index_name") or _env_opensearch_index()),
+                "took_ms": int(response_meta.get("took_ms") or 0),
+            }
+        )
+        _set_last_retrieval_meta(miss_meta)
+        return items
 
     dense_docs_scores = _vector_search(search_q, top_n=n, department=department)
     dense_items: List[Dict[str, Any]] = []
@@ -989,6 +1149,26 @@ def retrieve(
 
 def get_stats() -> RagStats:
     """返回当前 RAG 底座状态。"""
+    _, emb_info = get_embedder()
+    rerank_model = _env_rerank_model() if _env_use_reranker() else None
+
+    if _env_backend() == "opensearch":
+        store = get_opensearch_store()
+        try:
+            count = int(store.count())
+        except Exception:
+            count = 0
+        return RagStats(
+            backend="opensearch",
+            collection=str(store.config.index_name),
+            count=count,
+            persist_dir=str(store.config.url),
+            device=str((emb_info.device if emb_info else "") or resolve_embedding_device()),
+            embed_model=str((emb_info.model_name if emb_info else "") or _env_embed_model_default()),
+            rerank_model=rerank_model,
+            updated_at="",
+        )
+
     vs = get_vectordb()
 
     app_dir = resolve_app_dir(Path(__file__))
@@ -999,10 +1179,6 @@ def get_stats() -> RagStats:
         count = int(vs.count())
     except Exception:
         count = 0
-
-    _, emb_info = get_embedder()
-
-    rerank_model = _env_rerank_model() if _env_use_reranker() else None
 
     backend = getattr(vs, "backend_name", "faiss-hnsw")
     updated_at = ""

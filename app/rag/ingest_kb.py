@@ -28,6 +28,7 @@ from app.rag.utils.rag_shared import (
     resolve_persist_dir,
 )
 from app.rag.faiss_store import FaissHNSWStore
+from app.rag.opensearch_store import OpenSearchConfig, OpenSearchHybridStore
 
 
 apply_windows_openmp_workaround()
@@ -46,6 +47,95 @@ class RawDoc:
 class IngestProgress:
     version: int
     files: Dict[str, Dict[str, Any]]
+
+
+def _env_backend() -> str:
+    backend = (env_str("RAG_BACKEND", "") or "faiss").strip().lower()
+    if backend in {"opensearch", "open-search"}:
+        return "opensearch"
+    return "faiss"
+
+
+def _env_opensearch_url() -> str:
+    return env_str("OPENSEARCH_URL", "").strip()
+
+
+def _env_opensearch_index() -> str:
+    return (env_str("OPENSEARCH_INDEX", "") or env_str("RAG_COLLECTION", "") or DEFAULT_COLLECTION).strip()
+
+
+def _env_opensearch_username() -> str:
+    return env_str("OPENSEARCH_USERNAME", "").strip()
+
+
+def _env_opensearch_password() -> str:
+    return env_str("OPENSEARCH_PASSWORD", "").strip()
+
+
+def _env_opensearch_verify_ssl() -> bool:
+    return env_flag("OPENSEARCH_VERIFY_SSL", "0")
+
+
+def _env_opensearch_vector_dim() -> int:
+    value = env_int("OPENSEARCH_VECTOR_DIM", default=768)
+    if not value:
+        return 768
+    return max(1, int(value))
+
+
+def _env_opensearch_knn_k() -> int:
+    value = env_int("OPENSEARCH_KNN_K", default=30)
+    if not value:
+        return 30
+    return max(1, int(value))
+
+
+def _env_opensearch_num_candidates() -> int:
+    value = env_int("OPENSEARCH_NUM_CANDIDATES", default=128)
+    if not value:
+        return 128
+    return max(1, int(value))
+
+
+def get_opensearch_store() -> OpenSearchHybridStore:
+    url = _env_opensearch_url()
+    if not url:
+        raise RuntimeError("已启用 OpenSearch 入库，但未配置 OPENSEARCH_URL。")
+
+    return OpenSearchHybridStore(
+        OpenSearchConfig(
+            url=url,
+            index_name=_env_opensearch_index(),
+            vector_dim=_env_opensearch_vector_dim(),
+            username=_env_opensearch_username(),
+            password=_env_opensearch_password(),
+            verify_ssl=_env_opensearch_verify_ssl(),
+            knn_k=_env_opensearch_knn_k(),
+            num_candidates=_env_opensearch_num_candidates(),
+        )
+    )
+
+
+def _embed_texts(embeddings: Any, texts: List[str]) -> List[List[float]]:
+    if not texts:
+        return []
+    if hasattr(embeddings, "embed_documents"):
+        return [list(vec or []) for vec in embeddings.embed_documents(texts)]
+    return [list((embeddings.embed_query(text) or [])) for text in texts]
+
+
+def _flush_opensearch_batch(store: OpenSearchHybridStore, embeddings: Any, batch: List[Dict[str, Any]]) -> int:
+    if not batch:
+        return 0
+    vectors = _embed_texts(embeddings, [str(item.get("text") or "") for item in batch])
+    docs: List[Dict[str, Any]] = []
+    for item, vector in zip(batch, vectors):
+        payload = dict(item)
+        payload["embedding"] = vector
+        docs.append(payload)
+    written = store.bulk_upsert(docs)
+    batch.clear()
+    return written
 
 
 def _resolve_path_maybe_relative(base_dir: Path, p: str) -> Path:
@@ -797,10 +887,13 @@ def build_and_persist_store(
     embedding_model_name: Optional[str] = None,
 ) -> int:
     """Ingest kb_docs into a persistent Faiss-HNSW store. Returns number of chunks ingested."""
-    try:
-        from langchain.schema import Document  # type: ignore
-    except Exception as e:
-        raise RuntimeError("缺少 langchain 相关依赖，无法构建入库文档对象。") from e
+    opensearch_backend = _env_backend() == "opensearch"
+    Document = None
+    if not opensearch_backend:
+        try:
+            from langchain.schema import Document  # type: ignore
+        except Exception as e:
+            raise RuntimeError("缺少 langchain 相关依赖，无法构建入库文档对象。") from e
 
     # 强制“数据隔离”：只允许入库合并CSV目录（或其子目录）
     # 仍保留：RAG_INGEST_TXT=1 时可入库 txt（但在本工程默认目录里不会有总结/评测文件）
@@ -823,11 +916,16 @@ def build_and_persist_store(
 
     persist_dir.mkdir(parents=True, exist_ok=True)
 
-    vectordb = FaissHNSWStore(
-        persist_dir=persist_dir,
-        embedding_function=embeddings,
-        collection_name=collection_name,
-    )
+    vectordb = None
+    opensearch_store = None
+    if opensearch_backend:
+        opensearch_store = get_opensearch_store()
+    else:
+        vectordb = FaissHNSWStore(
+            persist_dir=persist_dir,
+            embedding_function=embeddings,
+            collection_name=collection_name,
+        )
 
     # 默认只入库 CSV：只扫描 kb_dir 下的 *.csv
     csv_files = sorted([p for p in kb_dir.rglob("*.csv") if p.is_file()]) if kb_dir.exists() else []
@@ -891,12 +989,12 @@ def build_and_persist_store(
     csv_soft_limit = int((env_str("RAG_CSV_SOFT_MAX_CHARS", "6000") or "6000"))
     max_csv_rows = env_int("RAG_CSV_MAX_ROWS", default=None)
 
-    batch: List[Document] = []
+    batch: List[Any] = []
     chunk_counter = 0
     batches_written = 0
 
     try:
-        count0 = vectordb.count()
+        count0 = opensearch_store.count() if opensearch_backend else vectordb.count()
     except Exception:
         count0 = None
 
@@ -946,12 +1044,20 @@ def build_and_persist_store(
             }
 
             chunk_counter += 1
-            batch.append(Document(page_content=str(txt), metadata=md))
+            if opensearch_backend:
+                payload = dict(md)
+                payload["text"] = str(txt)
+                batch.append(payload)
+            else:
+                batch.append(Document(page_content=str(txt), metadata=md))
             if len(batch) >= batch_size:
-                vectordb.add_documents(batch)
-                batch.clear()
+                if opensearch_backend:
+                    _flush_opensearch_batch(opensearch_store, embeddings, batch)
+                else:
+                    vectordb.add_documents(batch)
+                    batch.clear()
                 batches_written += 1
-                if persist_every_batches > 0 and (batches_written % persist_every_batches == 0):
+                if (not opensearch_backend) and persist_every_batches > 0 and (batches_written % persist_every_batches == 0):
                     vectordb.persist()
                     print(f"[PERSIST] txt file={txt_path.name} batches_written={batches_written} chunks_total={chunk_counter}", flush=True)
 
@@ -1022,13 +1128,21 @@ def build_and_persist_store(
                 md["source_path"] = key
                 md["chunk_id"] = f"{rd.metadata.get('source','')}:{rd.metadata.get('row','')}:{local_idx}"
                 # 强制保证写入索引的是 Python str（不是 bytes）
-                batch.append(Document(page_content=str(chunk), metadata=md))
+                if opensearch_backend:
+                    payload = dict(md)
+                    payload["text"] = str(chunk)
+                    batch.append(payload)
+                else:
+                    batch.append(Document(page_content=str(chunk), metadata=md))
 
                 if len(batch) >= batch_size:
-                    vectordb.add_documents(batch)
-                    batch.clear()
+                    if opensearch_backend:
+                        _flush_opensearch_batch(opensearch_store, embeddings, batch)
+                    else:
+                        vectordb.add_documents(batch)
+                        batch.clear()
                     batches_written += 1
-                    if persist_every_batches > 0 and (batches_written % persist_every_batches == 0):
+                    if (not opensearch_backend) and persist_every_batches > 0 and (batches_written % persist_every_batches == 0):
                         vectordb.persist()
                         print(f"[PERSIST] dept={dept} file={csv_path.name} batches_written={batches_written} chunks_total={chunk_counter}", flush=True)
 
@@ -1050,19 +1164,23 @@ def build_and_persist_store(
         print(f"[DONE_FILE] dept={dept} file={csv_path.name} last_row={last_seen_row} dept_ingested={dept_counts.get(dept,0)} reason={reason}", flush=True)
 
     if batch:
-        vectordb.add_documents(batch)
-        batch.clear()
+        if opensearch_backend:
+            _flush_opensearch_batch(opensearch_store, embeddings, batch)
+        else:
+            vectordb.add_documents(batch)
+            batch.clear()
 
-    vectordb.persist()
+    if not opensearch_backend:
+        vectordb.persist()
     try:
-        count1 = vectordb.count()
+        count1 = opensearch_store.count() if opensearch_backend else vectordb.count()
     except Exception:
         count1 = None
 
     print(
         "[RAG_INGEST] done "
         f"provider={emb_info.provider_used} model={emb_info.model_name} device={emb_info.device} "
-        f"collection={collection_name} count={count1} chunks_ingested={chunk_counter}",
+        f"collection={collection_name} backend={_env_backend()} count={count1} chunks_ingested={chunk_counter}",
         flush=True,
     )
     return chunk_counter

@@ -27,7 +27,6 @@ from app.rag.utils.rag_shared import (
     resolve_kb_dir_strict,
     resolve_persist_dir,
 )
-from app.rag.faiss_store import FaissHNSWStore
 from app.rag.opensearch_store import OpenSearchConfig, OpenSearchHybridStore
 
 
@@ -50,10 +49,10 @@ class IngestProgress:
 
 
 def _env_backend() -> str:
-    backend = (env_str("RAG_BACKEND", "") or "faiss").strip().lower()
-    if backend in {"opensearch", "open-search"}:
+    backend = (env_str("RAG_BACKEND", "") or "opensearch").strip().lower()
+    if not backend or backend in {"opensearch", "open-search"}:
         return "opensearch"
-    return "faiss"
+    raise RuntimeError("README 对齐后入库仅支持 OpenSearch，请移除 faiss 等非 OpenSearch 后端配置。")
 
 
 def _env_opensearch_url() -> str:
@@ -886,14 +885,8 @@ def build_and_persist_store(
     chunk_overlap: int = 100,
     embedding_model_name: Optional[str] = None,
 ) -> int:
-    """Ingest kb_docs into a persistent Faiss-HNSW store. Returns number of chunks ingested."""
-    opensearch_backend = _env_backend() == "opensearch"
-    Document = None
-    if not opensearch_backend:
-        try:
-            from langchain.schema import Document  # type: ignore
-        except Exception as e:
-            raise RuntimeError("缺少 langchain 相关依赖，无法构建入库文档对象。") from e
+    """Ingest kb_docs into the README-aligned OpenSearch store."""
+    _env_backend()
 
     # 强制“数据隔离”：只允许入库合并CSV目录（或其子目录）
     # 仍保留：RAG_INGEST_TXT=1 时可入库 txt（但在本工程默认目录里不会有总结/评测文件）
@@ -916,16 +909,7 @@ def build_and_persist_store(
 
     persist_dir.mkdir(parents=True, exist_ok=True)
 
-    vectordb = None
-    opensearch_store = None
-    if opensearch_backend:
-        opensearch_store = get_opensearch_store()
-    else:
-        vectordb = FaissHNSWStore(
-            persist_dir=persist_dir,
-            embedding_function=embeddings,
-            collection_name=collection_name,
-        )
+    opensearch_store = get_opensearch_store()
 
     # 默认只入库 CSV：只扫描 kb_dir 下的 *.csv
     csv_files = sorted([p for p in kb_dir.rglob("*.csv") if p.is_file()]) if kb_dir.exists() else []
@@ -994,7 +978,7 @@ def build_and_persist_store(
     batches_written = 0
 
     try:
-        count0 = opensearch_store.count() if opensearch_backend else vectordb.count()
+        count0 = opensearch_store.count()
     except Exception:
         count0 = None
 
@@ -1044,22 +1028,12 @@ def build_and_persist_store(
             }
 
             chunk_counter += 1
-            if opensearch_backend:
-                payload = dict(md)
-                payload["text"] = str(txt)
-                batch.append(payload)
-            else:
-                batch.append(Document(page_content=str(txt), metadata=md))
+            payload = dict(md)
+            payload["text"] = str(txt)
+            batch.append(payload)
             if len(batch) >= batch_size:
-                if opensearch_backend:
-                    _flush_opensearch_batch(opensearch_store, embeddings, batch)
-                else:
-                    vectordb.add_documents(batch)
-                    batch.clear()
+                _flush_opensearch_batch(opensearch_store, embeddings, batch)
                 batches_written += 1
-                if (not opensearch_backend) and persist_every_batches > 0 and (batches_written % persist_every_batches == 0):
-                    vectordb.persist()
-                    print(f"[PERSIST] txt file={txt_path.name} batches_written={batches_written} chunks_total={chunk_counter}", flush=True)
 
     for csv_path in csv_files:
         # 对“合并CSV目录”里的文件，科室就是文件名（去后缀）
@@ -1127,24 +1101,13 @@ def build_and_persist_store(
                 md["department_group"] = dept
                 md["source_path"] = key
                 md["chunk_id"] = f"{rd.metadata.get('source','')}:{rd.metadata.get('row','')}:{local_idx}"
-                # 强制保证写入索引的是 Python str（不是 bytes）
-                if opensearch_backend:
-                    payload = dict(md)
-                    payload["text"] = str(chunk)
-                    batch.append(payload)
-                else:
-                    batch.append(Document(page_content=str(chunk), metadata=md))
+                payload = dict(md)
+                payload["text"] = str(chunk)
+                batch.append(payload)
 
                 if len(batch) >= batch_size:
-                    if opensearch_backend:
-                        _flush_opensearch_batch(opensearch_store, embeddings, batch)
-                    else:
-                        vectordb.add_documents(batch)
-                        batch.clear()
+                    _flush_opensearch_batch(opensearch_store, embeddings, batch)
                     batches_written += 1
-                    if (not opensearch_backend) and persist_every_batches > 0 and (batches_written % persist_every_batches == 0):
-                        vectordb.persist()
-                        print(f"[PERSIST] dept={dept} file={csv_path.name} batches_written={batches_written} chunks_total={chunk_counter}", flush=True)
 
             rows_since_save += 1
             if rows_since_save >= progress_every_rows:
@@ -1164,16 +1127,9 @@ def build_and_persist_store(
         print(f"[DONE_FILE] dept={dept} file={csv_path.name} last_row={last_seen_row} dept_ingested={dept_counts.get(dept,0)} reason={reason}", flush=True)
 
     if batch:
-        if opensearch_backend:
-            _flush_opensearch_batch(opensearch_store, embeddings, batch)
-        else:
-            vectordb.add_documents(batch)
-            batch.clear()
-
-    if not opensearch_backend:
-        vectordb.persist()
+        _flush_opensearch_batch(opensearch_store, embeddings, batch)
     try:
-        count1 = opensearch_store.count() if opensearch_backend else vectordb.count()
+        count1 = opensearch_store.count()
     except Exception:
         count1 = None
 

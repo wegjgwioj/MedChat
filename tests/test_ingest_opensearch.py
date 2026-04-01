@@ -34,11 +34,6 @@ class _FakeOpenSearchStore:
         return sum(len(batch) for batch in self.batches)
 
 
-class _ForbiddenFaissStore:
-    def __init__(self, *args, **kwargs) -> None:
-        raise AssertionError("Faiss store should not be used when RAG_BACKEND=opensearch")
-
-
 def test_build_and_persist_store_uses_opensearch_bulk_and_preserves_metadata(tmp_path: Path, monkeypatch):
     kb_dir = tmp_path / "kb"
     persist_dir = tmp_path / "persist"
@@ -53,7 +48,6 @@ def test_build_and_persist_store_uses_opensearch_bulk_and_preserves_metadata(tmp
     monkeypatch.setenv("RAG_INGEST_BATCH_SIZE", "1")
     monkeypatch.setattr(ingest_kb, "make_embeddings", lambda: (_FakeEmbedder(), _FakeEmbeddingInfo()))
     monkeypatch.setattr(ingest_kb, "get_opensearch_store", lambda: fake_store)
-    monkeypatch.setattr(ingest_kb, "FaissHNSWStore", _ForbiddenFaissStore)
     monkeypatch.setattr(
         ingest_kb,
         "_iter_csv_docs",

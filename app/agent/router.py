@@ -1,13 +1,5 @@
 # -*- coding: utf-8 -*-
-"""router.py
-
-FastAPI 路由：/v1/agent/chat_v2
-
-设计：
-- 最小侵入式：只新增路由，不影响 /v1/triage 与 /v1/chat。
-- 前后端分离：前端每次带 session_id 即可延续会话。
-- 不泄漏隐私：日志最多前 100 字符或 hash。
-"""
+"""FastAPI routes for the README-aligned agent chat_v2 API."""
 
 from __future__ import annotations
 

@@ -1,12 +1,5 @@
 # -*- coding: utf-8 -*-
-"""retriever.py
-
-兼容层：对外保留 `retrieve(query, top_k=5)` 的调用方式与返回类型，
-内部实际由 M1 的 `app.rag.rag_core` 负责：
-- 统一 embedding 配置（默认 BCE embedding，GPU 优先）
-- 两阶段检索（向量召回 top_n + 可选 rerank）
-- 固定证据契约（字段齐全）
-"""
+"""Thin retrieval facade over the README-aligned OpenSearch hybrid core."""
 
 from __future__ import annotations
 
@@ -26,7 +19,7 @@ def retrieve(
 ) -> List[Dict[str, Any]]:
     """兼容入口：
 
-    - 保持 `retrieve(query, top_k=5)` 仍可用，以兼容 triage_service.py。
+    - 保持 `retrieve(query, top_k=5)` 仍可用，以兼容当前 agent 主链路。
     - 额外支持 M2 需要的参数：top_n/department/use_rerank。
     """
 

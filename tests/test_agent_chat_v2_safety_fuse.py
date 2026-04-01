@@ -10,8 +10,8 @@ from fastapi.testclient import TestClient
 
 from app import api_server
 from app.agent import graph, router
+from app.agent.storage_redis import RedisSessionStore
 from app.agent.state import AgentSessionState, LongitudinalRecordFact, Slots
-from app.agent.storage_sqlite import SqliteSessionStore
 
 
 def _confirmed_penicillin_allergy() -> LongitudinalRecordFact:
@@ -24,8 +24,27 @@ def _confirmed_penicillin_allergy() -> LongitudinalRecordFact:
     )
 
 
-def _save_answer_ready_session(db_path: Path, session_id: str) -> None:
-    store = SqliteSessionStore(db_path)
+class _FakeRedisClient:
+    def __init__(self) -> None:
+        self._data = {}
+
+    def ping(self) -> bool:
+        return True
+
+    def get(self, key: str):
+        return self._data.get(key)
+
+    def set(self, key: str, value):
+        self._data[key] = value
+        return True
+
+    def delete(self, key: str):
+        self._data.pop(key, None)
+        return 1
+
+
+def _build_answer_ready_store(session_id: str) -> RedisSessionStore:
+    store = RedisSessionStore(redis_url="redis://unit-test", client=_FakeRedisClient())
     session = AgentSessionState(
         session_id=session_id,
         slots=Slots(
@@ -39,23 +58,23 @@ def _save_answer_ready_session(db_path: Path, session_id: str) -> None:
         longitudinal_records=[_confirmed_penicillin_allergy()],
     )
     store.save_session(session)
+    return store
 
 
-def test_agent_chat_v2_blocks_conflicting_medication_and_appends_unified_trace(monkeypatch, tmp_path: Path):
+def test_agent_chat_v2_blocks_conflicting_medication_and_appends_unified_trace(monkeypatch):
     session_id = "agent-safety-session"
-    db_path = tmp_path / "agent.sqlite3"
-    _save_answer_ready_session(db_path, session_id)
+    store = _build_answer_ready_store(session_id)
 
-    monkeypatch.setenv("AGENT_SESSION_STORE", "sqlite")
-    monkeypatch.setenv("AGENT_SQLITE_DB_PATH", str(db_path))
+    monkeypatch.setenv("AGENT_REDIS_URL", "redis://unit-test")
     monkeypatch.setattr(graph, "_extract_slots_with_llm", lambda message: Slots())
     monkeypatch.setattr(graph, "_build_low_evidence_answer", lambda evidence: "建议先口服阿莫西林。")
+    monkeypatch.setattr(graph, "build_session_store", lambda: store)
     monkeypatch.setattr("app.rag.retriever.retrieve", lambda *args, **kwargs: [])
     monkeypatch.setattr("app.rag.retriever.get_last_retrieval_meta", lambda: {})
     monkeypatch.setattr(
         "app.rag.rag_core.get_stats",
         lambda: SimpleNamespace(
-            backend="faiss-hnsw",
+            backend="opensearch",
             device="cpu",
             collection="test",
             count=0,
@@ -76,6 +95,7 @@ def test_agent_chat_v2_blocks_conflicting_medication_and_appends_unified_trace(m
     assert "阿莫西林" not in out["answer"]
     assert "青霉素过敏" in out["answer"]
     assert out["trace"]["safety_fuse"]["blocked_count"] == 1
+    assert out["trace"]["storage"]["type"] == "redis"
 
 
 def test_agent_stream_final_event_reuses_same_final_result(monkeypatch):

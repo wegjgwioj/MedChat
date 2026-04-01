@@ -257,7 +257,12 @@ def _questions_hash(questions: List[Dict[str, Any]], ask_text: str) -> str:
     return _stable_hash_text(joined)
 
 
-def _missing_slots(slots: Slots, user_message: str, sess: Optional[AgentSessionState] = None) -> List[str]:
+def _missing_slots(
+    slots: Slots,
+    user_message: str,
+    sess: Optional[AgentSessionState] = None,
+    limit: Optional[int] = 3,
+) -> List[str]:
     """根据当前 slots 缺口动态决定追问槽位顺序（优先级而非写死）。
 
     批次2增强：
@@ -265,7 +270,9 @@ def _missing_slots(slots: Slots, user_message: str, sess: Optional[AgentSessionS
     - 过滤已达追问上限的槽位
     - 检测用户拒绝回答
 
-    约束：每轮最多 3 个。
+    约束：
+    - 默认每轮最多 3 个。
+    - `limit=None` 时返回完整缺口列表，供 trace/决策分析使用。
     """
 
     # 检测用户是否在本轮拒绝回答
@@ -330,7 +337,7 @@ def _missing_slots(slots: Slots, user_message: str, sess: Optional[AgentSessionS
                 continue
 
         filtered.append(s)
-        if len(filtered) >= 3:
+        if limit is not None and len(filtered) >= limit:
             break
 
     return filtered
@@ -1077,6 +1084,14 @@ def _node_safety_gate(state: AgentGraphState) -> Dict[str, Any]:
     phase0 = _classify_phase0_guardrail(msg)
     tr = state.get("trace") if isinstance(state.get("trace"), dict) else {}
     tr["phase0_guardrail"] = phase0
+    tr["phase0"] = {
+        "blocked": bool(phase0.get("blocked")),
+        "label": str(phase0.get("label") or "").strip(),
+        "hits": list(phase0.get("hits") or []),
+        "pii_masked": bool(phase0.get("pii_masked") or False),
+        "safe_message_hash": str(phase0.get("safe_message_hash") or "").strip(),
+        "status": "blocked" if bool(phase0.get("blocked")) else "passed",
+    }
     state["trace"] = cast(Dict[str, Any], tr)
 
     if bool(phase0.get("blocked")):
@@ -1228,6 +1243,7 @@ def _node_triage_planner(state: AgentGraphState) -> Dict[str, Any]:
 
     # ===== 批次3改动：使用带置信度的 kb_qa 检测 =====
     is_kb, kb_confidence = _looks_like_kb_question(user_msg)
+    missing_slots_all = _missing_slots(slots, user_msg, sess, limit=None)
 
     tr_any = state.get("trace")
     tr = tr_any if isinstance(tr_any, dict) else {}
@@ -1259,6 +1275,12 @@ def _node_triage_planner(state: AgentGraphState) -> Dict[str, Any]:
             **_record_confirmation_snapshot(sess),
             "active_fact_id": str(getattr(pending_fact, "fact_id", "") or "").strip(),
         }
+        tr["phase1"] = {
+            "decision": "ask",
+            "planner_strategy": "record_confirmation",
+            "missing_slots": ["record_confirmation"],
+            "question_count": len(state["questions"]),
+        }
         state["trace"] = cast(Dict[str, Any], tr)
         _trace_end(state, node, t0)
         return {
@@ -1278,6 +1300,12 @@ def _node_triage_planner(state: AgentGraphState) -> Dict[str, Any]:
         state["questions"] = []
         state["next_questions"] = []
         tr["planner_strategy"] = "kb_qa"
+        tr["phase1"] = {
+            "decision": "answer",
+            "planner_strategy": "kb_qa",
+            "missing_slots": [],
+            "question_count": 0,
+        }
         state["trace"] = cast(Dict[str, Any], tr)
         _trace_end(state, node, t0)
         return {
@@ -1304,6 +1332,24 @@ def _node_triage_planner(state: AgentGraphState) -> Dict[str, Any]:
         state["citations"] = []
     else:
         state["mode"] = "answer"
+
+    tr["phase1"] = {
+        "decision": str(state.get("mode") or "").strip() or "ask",
+        "planner_strategy": str(tr.get("planner_strategy") or "").strip() or "triage",
+        "missing_slots": missing_slots_all,
+        "question_count": len(state.get("questions") or []),
+    }
+    if state.get("mode") == "ask":
+        tr["phase1"]["asked_slots"] = [
+            str(item.get("slot") or "").strip()
+            for item in state.get("questions") or []
+            if isinstance(item, dict) and str(item.get("slot") or "").strip()
+        ]
+    else:
+        tr["phase1"]["asked_slots"] = []
+    if state.get("ask_text"):
+        tr["phase1"]["ask_text"] = str(state.get("ask_text") or "").strip()
+    state["trace"] = cast(Dict[str, Any], tr)
 
     _trace_end(state, node, t0)
     return {
@@ -1345,11 +1391,17 @@ def _node_rag_retrieve(state: AgentGraphState) -> Dict[str, Any]:
     if planner_strategy == "kb_qa":
         rag_query_parts = [f"问题：{msg}"]
     else:
-        structured_query = f"主诉：{chief_complaint}" if chief_complaint else str(sess.summary or "").strip()
-        rag_query_parts = [str(sess.record_summary or "").strip(), structured_query]
+        rag_query_parts = [f"主诉：{chief_complaint}" if chief_complaint else str(sess.summary or "").strip()]
     rag_query = "；".join([part for part in rag_query_parts if part]).strip("； ")
 
     dept = sess.slots.department_guess
+    tr["phase2"] = {
+        "chief_complaint": chief_complaint,
+        "retrieval_query": rag_query,
+        "retrieval_started": True,
+        "department": dept,
+        "planner_strategy": planner_strategy,
+    }
 
     # 调用 M1：必须走兼容层 app.rag.retriever.retrieve
     from app.rag.retriever import get_last_retrieval_meta as rag_get_last_retrieval_meta  # type: ignore
@@ -1372,7 +1424,7 @@ def _node_rag_retrieve(state: AgentGraphState) -> Dict[str, Any]:
 
     st = get_stats()
     tr["rag_stats"] = {
-        "backend": getattr(st, "backend", "faiss-hnsw"),
+        "backend": getattr(st, "backend", "opensearch"),
         "device": st.device,
         "collection": st.collection,
         "count": st.count,
